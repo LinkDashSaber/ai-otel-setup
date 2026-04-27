@@ -1,0 +1,20 @@
+Proprietary License - iFlyTek BG Internal
+
+Copyright (c) 2026 iFlyTek BG Productivity. All rights reserved.
+
+The source code in this repository is visible publicly to enable installation
+via `npx github:decent-yu/cc-otel-setup` from corporate machines. Visibility
+does NOT grant any license to use, modify, distribute, or sublicense the code
+outside of authorized iFlyTek internal contexts.
+
+Permitted use:
+  - Running the installer (`npx -y github:decent-yu/cc-otel-setup ...`)
+    on machines authorized to send observability data to iFlyTek-internal
+    OTel collectors.
+
+Prohibited without prior written permission:
+  - Copying, forking, vendoring the source for non-iFlyTek deployments
+  - Republishing under a different name or marketplace
+  - Embedding the code in third-party products
+
+For licensing questions: productivity@iflytek.example
