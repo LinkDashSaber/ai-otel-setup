@@ -1,6 +1,6 @@
 {
   "name": "cc-otel-installer",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "One-shot installer for Claude Code OpenTelemetry forwarding. Writes settings.json env + SessionStart hook + collector endpoint in a single npx command.",
   "bin": {
     "cc-otel-installer": "./cli.js"
