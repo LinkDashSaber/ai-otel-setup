@@ -3,13 +3,13 @@
  * cc-otel-installer
  *
  * 一行命令配置 Claude Code OTel 上报：
- *   npx -y github:decent-yu/cc-otel-setup url=COLLECTOR_HOST bg=BG dept=DEPT team=TEAM
+ *   npx -y github:decent-yu/cc-otel-setup url=COLLECTOR_HOST
  *
  * 兼容写法：参数也可以全部塞在一个 argv 里，用逗号分隔：
- *   npx -y github:decent-yu/cc-otel-setup url=COLLECTOR_HOST,bg=BG,dept=DEPT,team=TEAM
+ *   npx -y github:decent-yu/cc-otel-setup url=COLLECTOR_HOST
  *
  * 该 installer **不走 CC plugin 机制**：直接把 hook 脚本铺到
- * ~/.claude/cc-otel/，并把 13 个 OTel env + SessionStart hook 注入
+ * ~/.claude/cc-otel/，并把 12 个 OTel env + SessionStart hook 注入
  * 用户的 ~/.claude/settings.json。安装后 `claude` 立即生效，无需 /plugin install。
  *
  * 关键约束：
@@ -25,7 +25,7 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
-const REQUIRED_KEYS = ["url", "bg", "dept", "team"];
+const REQUIRED_KEYS = ["url"];
 const HOOK_ID = "team:session-start";
 const OTEL_KEYS = [
   "CLAUDE_CODE_ENABLE_TELEMETRY",
@@ -35,7 +35,6 @@ const OTEL_KEYS = [
   "OTEL_EXPORTER_OTLP_ENDPOINT",
   "OTEL_LOGS_EXPORT_INTERVAL",
   "OTEL_METRIC_EXPORT_INTERVAL",
-  "OTEL_RESOURCE_ATTRIBUTES",
   "OTEL_METRICS_INCLUDE_VERSION",
   "OTEL_LOG_USER_PROMPTS",
   "OTEL_LOG_TOOL_DETAILS",
@@ -49,7 +48,7 @@ function parseArgs(argv) {
   const out = {};
   const flat = [];
   for (const a of argv) {
-    // 兼容 url=x,bg=y 单 argv 与 url=x bg=y 多 argv
+    // 兼容 url=x 单 argv 与 url=x 多 argv（保留逗号分隔，便于未来扩展）
     for (const part of a.split(",")) {
       if (part.trim()) flat.push(part.trim());
     }
@@ -122,7 +121,8 @@ function backup(p) {
 function buildEnv(template, args, endpoint) {
   const env = { ...template.env };
   env.OTEL_EXPORTER_OTLP_ENDPOINT = endpoint;
-  env.OTEL_RESOURCE_ATTRIBUTES = `bg=${args.bg},dept=${args.dept},team=${args.team}`;
+  // OTEL_RESOURCE_ATTRIBUTES 已废弃：bg/dept/team 不再上报
+  delete env.OTEL_RESOURCE_ATTRIBUTES;
   return env;
 }
 
@@ -134,6 +134,8 @@ function mergeSettings(existing, newEnv, hookEntry) {
   for (const k of OTEL_KEYS) {
     merged.env[k] = newEnv[k];
   }
+  // 清理历史遗留：旧版本 installer 写过 OTEL_RESOURCE_ATTRIBUTES，删掉
+  delete merged.env.OTEL_RESOURCE_ATTRIBUTES;
 
   // hooks.SessionStart：按 id 去重，存在则覆盖，不存在则追加
   merged.hooks = { ...(existing.hooks || {}) };
@@ -211,28 +213,20 @@ function main() {
   console.log("[cc-otel-installer] 安装完成。");
   console.log("");
   console.log("  endpoint     : " + endpoint);
-  console.log("  bg/dept/team : " + `${args.bg} / ${args.dept} / ${args.team}`);
   console.log("  hook script  : " + hookScriptDest);
   console.log("  settings     : " + settingsPath);
   if (bak) console.log("  backup       : " + bak);
   console.log("");
   console.log("接下来：直接运行 `claude`，下次会话启动即自动上报。");
-  console.log("卸载：删除 " + installDir + " 并从 settings.json 移除 13 个 OTEL_* env 与 SessionStart 中 id=" + HOOK_ID + " 的条目。");
+  console.log("卸载：删除 " + installDir + " 并从 settings.json 移除 12 个 OTEL_* env 与 SessionStart 中 id=" + HOOK_ID + " 的条目。");
 }
 
 function printUsage() {
   console.log(`Usage:
-  npx -y github:decent-yu/cc-otel-setup url=COLLECTOR_HOST bg=BG dept=DEPT team=TEAM
+  npx -y github:decent-yu/cc-otel-setup url=COLLECTOR_HOST
 
-参数（全部必填）：
+参数（必填）：
   url    Collector host（裸 IP/域名，自动补 http://...:4317；也可传完整 URL）
-  bg     业务 BG 名称（写入 OTEL_RESOURCE_ATTRIBUTES.bg）
-  dept   部门（写入 OTEL_RESOURCE_ATTRIBUTES.dept）
-  team   团队（写入 OTEL_RESOURCE_ATTRIBUTES.team）
-
-注意：上面四个全大写词都是占位符，需替换为本团队的实际值。
-也支持参数用逗号合并到一个 argv：
-  npx -y github:decent-yu/cc-otel-setup url=COLLECTOR_HOST,bg=BG,dept=DEPT,team=TEAM
 `);
 }
 

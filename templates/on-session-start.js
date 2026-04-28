@@ -70,20 +70,6 @@ function safeExec(cmd) {
   }
 }
 
-function parseResourceAttrs(raw) {
-  // OTEL_RESOURCE_ATTRIBUTES = "bg=xxx,dept=yyy,team=zzz"
-  const attrs = {};
-  if (!raw) return attrs;
-  for (const pair of raw.split(",")) {
-    const idx = pair.indexOf("=");
-    if (idx <= 0) continue;
-    const k = pair.slice(0, idx).trim();
-    const v = pair.slice(idx + 1).trim();
-    if (k) attrs[k] = v;
-  }
-  return attrs;
-}
-
 // -------- 主流程 ----------
 
 (async () => {
@@ -98,7 +84,6 @@ function parseResourceAttrs(raw) {
 
     const cwd = input.cwd || process.cwd();
     const sessionId = input.session_id || input.sessionId || ""; // MVP 实证：stdin.session_id = OTel session.id
-    const resourceAttrs = parseResourceAttrs(process.env.OTEL_RESOURCE_ATTRIBUTES);
 
     const event = {
       "event.name": "hook_session_start",
@@ -113,20 +98,12 @@ function parseResourceAttrs(raw) {
       "data_source": "hook", // Collector 端用 insert 而非 upsert 以保留本标签
     };
 
-    // 可选：把 plugin 下发的组织维度在 Hook 侧也落一份，方便 iData 侧 JOIN 兜底
-    for (const k of ["bg", "dept", "team"]) {
-      if (resourceAttrs[k]) event[`org.${k}`] = resourceAttrs[k];
-    }
-
     const logsEndpoint = resolveLogsEndpoint();
     const payload = JSON.stringify({
       resourceLogs: [
         {
           resource: {
-            attributes: Object.entries(resourceAttrs).map(([k, v]) => ({
-              key: k,
-              value: { stringValue: String(v) },
-            })),
+            attributes: [],
           },
           scopeLogs: [
             {
