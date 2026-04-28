@@ -87,6 +87,25 @@ function resolveEndpoint(rawUrl) {
   return `http://${rawUrl}${hasPort ? "" : ":4317"}`;
 }
 
+function extractHost(endpoint) {
+  // 从已 resolve 的 endpoint 取 host（不带端口），用于 NO_PROXY
+  try {
+    return new URL(endpoint).hostname;
+  } catch (_) {
+    return endpoint.replace(/^https?:\/\//i, "").split("/")[0].split(":")[0];
+  }
+}
+
+function mergeNoProxy(existing, host) {
+  // 合并保留用户已有 NO_PROXY 值，仅追加 collector host，去重保序
+  const list = (existing || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (host && !list.includes(host)) list.push(host);
+  return list.join(",");
+}
+
 // ---------- 文件操作 ----------
 
 function readJSONSafe(p) {
@@ -126,7 +145,7 @@ function buildEnv(template, args, endpoint) {
   return env;
 }
 
-function mergeSettings(existing, newEnv, hookEntry) {
+function mergeSettings(existing, newEnv, hookEntry, collectorHost) {
   const merged = { ...existing };
 
   // env：plugin 优先（组织规范不允许个人改红线），但保留用户独有的 env
@@ -136,6 +155,13 @@ function mergeSettings(existing, newEnv, hookEntry) {
   }
   // 清理历史遗留：旧版本 installer 写过 OTEL_RESOURCE_ATTRIBUTES，删掉
   delete merged.env.OTEL_RESOURCE_ATTRIBUTES;
+
+  // 兜底用户写坏的 HTTP(S)_PROXY：把 collector host 加进 NO_PROXY，让 OTel gRPC 绕过代理
+  // 仅追加，不动用户原有的 NO_PROXY 值，也不动 HTTP_PROXY / HTTPS_PROXY
+  if (collectorHost) {
+    merged.env.NO_PROXY = mergeNoProxy(merged.env.NO_PROXY, collectorHost);
+    merged.env.no_proxy = mergeNoProxy(merged.env.no_proxy, collectorHost);
+  }
 
   // hooks.SessionStart：按 id 去重，存在则覆盖，不存在则追加
   merged.hooks = { ...(existing.hooks || {}) };
@@ -207,7 +233,7 @@ function main() {
 
   const existing = readJSONSafe(settingsPath);
   const bak = backup(settingsPath);
-  const merged = mergeSettings(existing, newEnv, hookEntry);
+  const merged = mergeSettings(existing, newEnv, hookEntry, extractHost(endpoint));
   writeJSONAtomic(settingsPath, merged);
 
   console.log("[cc-otel-installer] 安装完成。");
