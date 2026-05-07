@@ -1,18 +1,20 @@
-# Claude Code 上报工具
+# AI CLI 上报工具
 
-一键开通团队的 Claude Code 使用数据上报。
+一键开通团队的 Claude Code / Codex CLI / Gemini CLI 使用数据上报。
 
 ## 安装
 
 ```bash
-npx -y cc-otel-installer url=你的服务器地址
+npx -y ai-otel-setup url=你的服务器地址
 ```
 
 > 国内网络慢可以临时切到淘宝镜像：`npm config set registry https://registry.npmmirror.com`，再执行上面的命令。
+>
+> 兼容旧命令：`npx -y cc-otel-installer url=...` 仍然可用，行为完全一致。
 
 把 `你的服务器地址` 替换成团队提供的实际地址（例如 `url=10.20.30.40`）。具体地址请向团队负责人索取。
 
-装好后直接运行 `claude`，上报会自动开始，无需任何额外配置。
+装好后直接运行 `claude` / `codex` / `gemini`，上报会自动开始，无需任何额外配置。
 
 ## 参数
 

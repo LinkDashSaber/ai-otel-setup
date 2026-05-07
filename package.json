@@ -1,10 +1,10 @@
 {
-  "name": "ai-otel-installer",
+  "name": "ai-otel-setup",
   "version": "1.0.2",
   "description": "One-shot installer for AI CLI OpenTelemetry forwarding. Writes Claude Code, Codex CLI, and Gemini CLI telemetry config in a single npx command.",
   "bin": {
-    "ai-otel-installer": "./cli.js",
-    "cc-otel-installer": "./cli.js"
+    "ai-otel-setup": "cli.js",
+    "cc-otel-installer": "cli.js"
   },
   "main": "./cli.js",
   "preferGlobal": true,

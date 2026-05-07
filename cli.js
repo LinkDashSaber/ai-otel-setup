@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * ai-otel-installer
+ * ai-otel-setup
  *
  * 一行命令配置 Claude Code OTel 上报：
- *   npx -y ai-otel-installer url=COLLECTOR_HOST
+ *   npx -y ai-otel-setup url=COLLECTOR_HOST
  *
  * 兼容写法：参数也可以全部塞在一个 argv 里，用逗号分隔：
  *   npx -y cc-otel-installer url=COLLECTOR_HOST
@@ -225,8 +225,8 @@ function logsEndpointFromGrpc(endpoint) {
 // 嵌套子表 + 嵌套数组用 hand-rolled 正则维护太脆，改成"managed 块"风格：
 // 用 BEGIN/END 标记夹住整段我们写的内容，重跑 installer 时整块剥离再追加。
 
-const CODEX_MANAGED_BEGIN = "# >>> ai-otel-installer managed >>>";
-const CODEX_MANAGED_END = "# <<< ai-otel-installer managed <<<";
+const CODEX_MANAGED_BEGIN = "# >>> ai-otel-setup managed >>>";
+const CODEX_MANAGED_END = "# <<< ai-otel-setup managed <<<";
 
 function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -372,7 +372,7 @@ function main() {
 
   const errs = validateArgs(args);
   if (errs.length) {
-    console.error("[cc-otel-installer] 参数错误：");
+    console.error("[ai-otel-setup] 参数错误：");
     for (const e of errs) console.error("  - " + e);
     console.error("");
     printUsage();
@@ -390,7 +390,7 @@ function main() {
   const hookScriptSrc = path.join(templateDir, "on-session-start.js");
 
   if (!fs.existsSync(hookScriptSrc)) {
-    console.error(`[cc-otel-installer] 找不到 hook 模板：${hookScriptSrc}`);
+    console.error(`[ai-otel-setup] 找不到 hook 模板：${hookScriptSrc}`);
     process.exit(1);
   }
 
@@ -407,7 +407,7 @@ function main() {
       },
     ],
     description:
-      "cc-otel-installer 注入：补采项目/git/hostname 维度，POST 到 OTLP/HTTP 4318",
+      "ai-otel-setup 注入：补采项目/git/hostname 维度，POST 到 OTLP/HTTP 4318",
     id: HOOK_ID,
   };
 
@@ -424,7 +424,7 @@ function main() {
       },
     ],
     description:
-      "cc-otel-installer 注入：UserPromptSubmit 兜底，救 SessionStart 漏发场景",
+      "ai-otel-setup 注入：UserPromptSubmit 兜底，救 SessionStart 漏发场景",
     id: PROMPT_HOOK_ID,
   };
 
@@ -458,7 +458,7 @@ function main() {
   const debug = !!args.debug || process.argv.includes("--debug") || process.argv.includes("-d");
   const allResults = [{ tool: "claude", status: "installed" }, ...results];
 
-  console.log("[ai-otel-installer] 安装完成。");
+  console.log("[ai-otel-setup] 安装完成。");
   console.log("");
   console.log(`  ${"endpoint".padEnd(12)}: ${endpoint}`);
   for (const r of allResults) {
@@ -485,7 +485,7 @@ function main() {
 
 function printUsage() {
   console.log(`Usage:
-  npx -y ai-otel-installer url=COLLECTOR_HOST
+  npx -y ai-otel-setup url=COLLECTOR_HOST
 
 参数（必填）：
   url    Collector host（裸 IP/域名，自动补 http://...:4317；也可传完整 URL）
@@ -498,6 +498,6 @@ function printUsage() {
 try {
   main();
 } catch (e) {
-  console.error("[cc-otel-installer] 失败：" + (e && e.message ? e.message : e));
+  console.error("[ai-otel-setup] 失败：" + (e && e.message ? e.message : e));
   process.exit(1);
 }
