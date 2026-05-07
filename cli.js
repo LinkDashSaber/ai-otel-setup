@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * cc-otel-installer
+ * ai-otel-installer
  *
  * 一行命令配置 Claude Code OTel 上报：
- *   npx -y cc-otel-installer url=COLLECTOR_HOST
+ *   npx -y ai-otel-installer url=COLLECTOR_HOST
  *
  * 兼容写法：参数也可以全部塞在一个 argv 里，用逗号分隔：
  *   npx -y cc-otel-installer url=COLLECTOR_HOST
@@ -14,7 +14,7 @@
  *
  * 关键约束：
  *   - 失败时尽量给出可操作信息，不静默
- *   - settings.json 写之前会备份到 settings.json.bak.<ts>
+ *   - settings.json 写之前会备份到 settings.json.bak（每次覆盖，仅保留上一份）
  *   - 多次运行幂等（按 hook id=team:session-start 去重）
  *   - 不依赖任何运行时第三方包，只用 Node 标准库
  */
@@ -27,6 +27,9 @@ const os = require("os");
 
 const REQUIRED_KEYS = ["url"];
 const HOOK_ID = "team:session-start";
+// UserPromptSubmit 兜底 hook：复用同一脚本，靠 stdin.hook_event_name 分流；
+// 单独 id 是为了让 settings.json 的 SessionStart / UserPromptSubmit 数组各自能按 id 去重
+const PROMPT_HOOK_ID = "team:user-prompt-submit";
 const OTEL_KEYS = [
   "CLAUDE_CODE_ENABLE_TELEMETRY",
   "OTEL_METRICS_EXPORTER",
@@ -129,8 +132,7 @@ function writeJSONAtomic(p, obj) {
 
 function backup(p) {
   if (!fs.existsSync(p)) return null;
-  const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  const bak = `${p}.bak.${ts}`;
+  const bak = `${p}.bak`;
   fs.copyFileSync(p, bak);
   return bak;
 }
@@ -145,7 +147,7 @@ function buildEnv(template, args, endpoint) {
   return env;
 }
 
-function mergeSettings(existing, newEnv, hookEntry, collectorHost) {
+function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, collectorHost) {
   const merged = { ...existing };
 
   // env：plugin 优先（组织规范不允许个人改红线），但保留用户独有的 env
@@ -163,8 +165,9 @@ function mergeSettings(existing, newEnv, hookEntry, collectorHost) {
     merged.env.no_proxy = mergeNoProxy(merged.env.no_proxy, collectorHost);
   }
 
-  // hooks.SessionStart：按 id 去重，存在则覆盖，不存在则追加
   merged.hooks = { ...(existing.hooks || {}) };
+
+  // hooks.SessionStart：按 id 去重，存在则覆盖，不存在则追加
   const sessionStart = Array.isArray(merged.hooks.SessionStart)
     ? [...merged.hooks.SessionStart]
     : [];
@@ -173,7 +176,188 @@ function mergeSettings(existing, newEnv, hookEntry, collectorHost) {
   else sessionStart.push(hookEntry);
   merged.hooks.SessionStart = sessionStart;
 
+  // hooks.UserPromptSubmit：兜底 hook，按 PROMPT_HOOK_ID 去重，规则同上
+  if (promptHookEntry) {
+    const userPromptSubmit = Array.isArray(merged.hooks.UserPromptSubmit)
+      ? [...merged.hooks.UserPromptSubmit]
+      : [];
+    const pidx = userPromptSubmit.findIndex((h) => h && h.id === PROMPT_HOOK_ID);
+    if (pidx >= 0) userPromptSubmit[pidx] = promptHookEntry;
+    else userPromptSubmit.push(promptHookEntry);
+    merged.hooks.UserPromptSubmit = userPromptSubmit;
+  }
+
   return merged;
+}
+
+function logsEndpointFromGrpc(endpoint) {
+  try {
+    const url = new URL(endpoint);
+    if (url.port === "4317") url.port = "4318";
+    if (!url.pathname || url.pathname === "/") url.pathname = "/v1/logs";
+    return url.toString();
+  } catch (_) {
+    return "http://localhost:4318/v1/logs";
+  }
+}
+
+// ---------- Codex config.toml 处理 ----------
+//
+// 真实 schema（参见 https://developers.openai.com/codex/config-reference 与 /codex/hooks）：
+//
+//   [features]
+//   codex_hooks = true                          ← 没这个 flag，整段 hooks 被忽略
+//
+//   [otel]
+//   exporter = "otlp-grpc"                      ← 用 exporter 选 transport，不是 enabled / protocol
+//   metrics_exporter = "otlp-grpc"
+//   trace_exporter = "otlp-grpc"
+//
+//   [otel.exporter.otlp-grpc]                   ← 端点写在嵌套子表里
+//   endpoint = "http://host:4317"
+//
+//   [[hooks.SessionStart]]                      ← codex 真的有 SessionStart
+//   matcher = "startup|resume"
+//   [[hooks.SessionStart.hooks]]                ← 真正的 command 嵌一层
+//   type = "command"
+//   command = "..."
+//
+// 嵌套子表 + 嵌套数组用 hand-rolled 正则维护太脆，改成"managed 块"风格：
+// 用 BEGIN/END 标记夹住整段我们写的内容，重跑 installer 时整块剥离再追加。
+
+const CODEX_MANAGED_BEGIN = "# >>> ai-otel-installer managed >>>";
+const CODEX_MANAGED_END = "# <<< ai-otel-installer managed <<<";
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function stripCodexManagedBlock(text) {
+  const re = new RegExp(
+    `\\n?${escapeRegex(CODEX_MANAGED_BEGIN)}[\\s\\S]*?${escapeRegex(CODEX_MANAGED_END)}\\n?`,
+    "g"
+  );
+  return text.replace(re, "\n");
+}
+
+function stripLegacyCodexOtel(text) {
+  // 旧 installer 写的 [otel]（含非法 key enabled = true）整段删除，避免与新 [otel] 冲突
+  return text.replace(
+    /(?:\n|^)\[otel\][\s\S]*?(?=\n\[|\n\[\[|$)/g,
+    (m) => (/enabled\s*=\s*true/.test(m) ? "" : m)
+  );
+}
+
+function stripLegacyCodexHook(text) {
+  // 旧 installer 写的 [[hooks.UserPromptSubmit]] + id = "team:session-start" 整块删除
+  return text.replace(
+    /(?:\n|^)\[\[hooks\.UserPromptSubmit\]\][\s\S]*?(?=\n\[\[|\n\[|$)/g,
+    (m) => (/id\s*=\s*["']team:session-start["']/.test(m) ? "" : m)
+  );
+}
+
+function buildCodexManagedBlock(endpoint, hookDest, logsEndpoint) {
+  // exporter / trace_exporter / metrics_exporter 是 externally-tagged enum：
+  //   - 写 scalar `exporter = "otlp-grpc"`：codex 解析为 unit variant，因为
+  //     OtlpGrpc 是 struct variant（带 endpoint 等字段），报
+  //     "invalid type: unit variant, expected struct variant"。
+  //   - 同时写 scalar 和 table：报 "cannot extend value of type string"。
+  //   - 只写 table `[otel.exporter."otlp-grpc"]`：✓ codex 把它解析为
+  //     OtlpGrpc { endpoint }，tag 来自 key 名。
+  // 官方 sample 之所以能 `exporter = "none"`，是因为 None 本身就是 unit variant。
+  return [
+    CODEX_MANAGED_BEGIN,
+    "[features]",
+    "codex_hooks = true",
+    "",
+    "[otel]",
+    'environment = "prod"',
+    "log_user_prompt = false",
+    "",
+    '[otel.exporter."otlp-grpc"]',
+    `endpoint = ${JSON.stringify(endpoint)}`,
+    "",
+    '[otel.trace_exporter."otlp-grpc"]',
+    `endpoint = ${JSON.stringify(endpoint)}`,
+    "",
+    '[otel.metrics_exporter."otlp-grpc"]',
+    `endpoint = ${JSON.stringify(endpoint)}`,
+    "",
+    "[[hooks.SessionStart]]",
+    'matcher = "startup|resume"',
+    "",
+    "[[hooks.SessionStart.hooks]]",
+    'type = "command"',
+    `command = ${JSON.stringify(`AI_OTEL_LOGS_ENDPOINT=${logsEndpoint} node "${hookDest}"`)}`,
+    CODEX_MANAGED_END,
+  ].join("\n");
+}
+
+function installCodex(home, endpoint) {
+  const codexDir = path.join(home, ".codex");
+  if (!fs.existsSync(codexDir)) {
+    return { tool: "codex", status: "skipped", reason: "未检测到 ~/.codex" };
+  }
+  const installDir = path.join(codexDir, "ai-otel");
+  const configPath = path.join(codexDir, "config.toml");
+  const hookDest = path.join(installDir, "on-session-start.js");
+  fs.mkdirSync(installDir, { recursive: true });
+  fs.copyFileSync(path.join(__dirname, "templates", "codex", "on-session-start.js"), hookDest);
+  fs.chmodSync(hookDest, 0o755);
+  const bak = backup(configPath);
+  let existing = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
+
+  // 三步去重：先剥离上一次的 managed 块，再清掉旧 schema 残留
+  existing = stripCodexManagedBlock(existing);
+  existing = stripLegacyCodexOtel(existing);
+  existing = stripLegacyCodexHook(existing);
+
+  const logsEndpoint = logsEndpointFromGrpc(endpoint);
+  const managed = buildCodexManagedBlock(endpoint, hookDest, logsEndpoint);
+  const merged = (existing.trimEnd() + "\n\n" + managed + "\n").replace(/\n{3,}/g, "\n\n");
+  fs.writeFileSync(configPath, merged, "utf8");
+  return { tool: "codex", status: "installed", path: configPath, backup: bak };
+}
+
+function installGemini(home, endpoint) {
+  const geminiDir = path.join(home, ".gemini");
+  if (!fs.existsSync(geminiDir)) {
+    return { tool: "gemini", status: "skipped", reason: "未检测到 ~/.gemini" };
+  }
+  const installDir = path.join(geminiDir, "ai-otel");
+  const settingsPath = path.join(geminiDir, "settings.json");
+  const hookDest = path.join(installDir, "on-session-start.js");
+  fs.mkdirSync(installDir, { recursive: true });
+  fs.copyFileSync(path.join(__dirname, "templates", "gemini", "on-session-start.js"), hookDest);
+  fs.chmodSync(hookDest, 0o755);
+  const existing = readJSONSafe(settingsPath);
+  const bak = backup(settingsPath);
+  const merged = { ...existing };
+  // ⚠️ Gemini telemetry.target 只支持 "local" 与 "gcp"，没有 "otlp" 枚举值。
+  //    指向自建 OTLP 接收端的标准用法是 target=local + otlpEndpoint=<url>。
+  //    见调研：docs/superpowers/specs/2026-04-29-multi-cli-otel-research.md §2.2
+  merged.telemetry = {
+    ...(existing.telemetry || {}),
+    enabled: true,
+    target: "local",
+    otlpEndpoint: endpoint,
+    otlpProtocol: "grpc",
+    logPrompts: false,
+  };
+  merged.hooks = { ...(existing.hooks || {}) };
+  const sessionStart = Array.isArray(merged.hooks.SessionStart)
+    ? [...merged.hooks.SessionStart]
+    : [];
+  const hookEntry = {
+    id: HOOK_ID,
+    command: `node "${hookDest}"`,
+  };
+  const idx = sessionStart.findIndex((h) => h && h.id === HOOK_ID);
+  if (idx >= 0) sessionStart[idx] = hookEntry;
+  else sessionStart.push(hookEntry);
+  merged.hooks.SessionStart = sessionStart;
+  writeJSONAtomic(settingsPath, merged);
+  return { tool: "gemini", status: "installed", path: settingsPath, backup: bak };
 }
 
 // ---------- 主流程 ----------
@@ -227,32 +411,87 @@ function main() {
     id: HOOK_ID,
   };
 
+  // UserPromptSubmit 兜底 hook：复用同一脚本，由 stdin.hook_event_name 在脚本内部
+  // 分流。客户端做 5 分钟节流，服务端见 entry 已存在则仅补空。用于救 SessionStart
+  // 因网络/超时丢失的场景（线上观测约 60% 事件因此空 git/hostname）。
+  const promptHookEntry = {
+    matcher: "*",
+    hooks: [
+      {
+        type: "command",
+        command: `node "${hookScriptDest}"`,
+        timeout: 3,
+      },
+    ],
+    description:
+      "cc-otel-installer 注入：UserPromptSubmit 兜底，救 SessionStart 漏发场景",
+    id: PROMPT_HOOK_ID,
+  };
+
   fs.mkdirSync(installDir, { recursive: true });
   fs.copyFileSync(hookScriptSrc, hookScriptDest);
   fs.chmodSync(hookScriptDest, 0o755);
 
   const existing = readJSONSafe(settingsPath);
   const bak = backup(settingsPath);
-  const merged = mergeSettings(existing, newEnv, hookEntry, extractHost(endpoint));
+  const merged = mergeSettings(
+    existing,
+    newEnv,
+    hookEntry,
+    promptHookEntry,
+    extractHost(endpoint)
+  );
   writeJSONAtomic(settingsPath, merged);
 
-  console.log("[cc-otel-installer] 安装完成。");
+  const results = [];
+  try {
+    results.push(installCodex(home, endpoint));
+  } catch (e) {
+    results.push({ tool: "codex", status: "failed", reason: e.message });
+  }
+  try {
+    results.push(installGemini(home, endpoint));
+  } catch (e) {
+    results.push({ tool: "gemini", status: "failed", reason: e.message });
+  }
+
+  const debug = !!args.debug || process.argv.includes("--debug") || process.argv.includes("-d");
+  const allResults = [{ tool: "claude", status: "installed" }, ...results];
+
+  console.log("[ai-otel-installer] 安装完成。");
   console.log("");
-  console.log("  endpoint     : " + endpoint);
-  console.log("  hook script  : " + hookScriptDest);
-  console.log("  settings     : " + settingsPath);
-  if (bak) console.log("  backup       : " + bak);
+  console.log(`  ${"endpoint".padEnd(12)}: ${endpoint}`);
+  for (const r of allResults) {
+    console.log(`  ${r.tool.padEnd(12)}: ${r.status}${r.reason ? " (" + r.reason + ")" : ""}`);
+  }
+  if (debug) {
+    console.log(`  ${"hook script".padEnd(12)}: ${hookScriptDest}`);
+    console.log(`  ${"settings".padEnd(12)}: ${settingsPath}`);
+    if (bak) console.log(`  ${"backup".padEnd(12)}: ${bak}`);
+  }
   console.log("");
-  console.log("接下来：直接运行 `claude`，下次会话启动即自动上报。");
-  console.log("卸载：删除 " + installDir + " 并从 settings.json 移除 12 个 OTEL_* env 与 SessionStart 中 id=" + HOOK_ID + " 的条目。");
+  console.log("接下来：直接运行 `claude` / `codex` / `gemini`，下次会话启动即自动上报。");
+  if (debug) {
+    console.log(
+      "卸载：删除 " +
+        installDir +
+        " 与 " +
+        path.join(claudeDir, "cc-otel-state") +
+        "（marker 目录），并从 settings.json 移除 12 个 OTEL_* env、" +
+        "SessionStart 中 id=" + HOOK_ID + " 与 UserPromptSubmit 中 id=" + PROMPT_HOOK_ID + " 的条目。"
+    );
+  }
 }
 
 function printUsage() {
   console.log(`Usage:
-  npx -y cc-otel-installer url=COLLECTOR_HOST
+  npx -y ai-otel-installer url=COLLECTOR_HOST
 
 参数（必填）：
   url    Collector host（裸 IP/域名，自动补 http://...:4317；也可传完整 URL）
+
+可选：
+  debug=1 | --debug   显示安装路径、备份路径与卸载提示
 `);
 }
 

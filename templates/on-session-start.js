@@ -1,27 +1,41 @@
 #!/usr/bin/env node
 /**
- * SessionStart hook —— v1.2 §3.2 的生产实现
+ * SessionStart / UserPromptSubmit 兜底 hook
  *
  * 职责：
  *   采集 CC 原生 OTel 不覆盖的 5 个字段（cwd / git_remote / git_user_email /
  *   git_user_name / hostname），通过 OTLP/HTTP 4318 发给 Collector，
  *   与 OTel 主流合流。
  *
- * 关键约束（v1.2 §3.2 / §9）：
+ * 双 hook 复用同一脚本：
+ *   - SessionStart 触发：每次 claude 启动；生成 hook_kind="session_start"
+ *   - UserPromptSubmit 触发：每次用户输入 prompt；生成 hook_kind="user_prompt_fallback"
+ *     用于救回 SessionStart 因网络/超时丢失的 session（服务端见 entry 已存在则忽略）
+ *
+ * 关键约束：
  *   - 不读源代码，只读 git 元信息
- *   - 总耗时 < 3s（hooks.json 已设 timeout=3）
- *   - 失败静默，绝不阻塞 CC 启动
- *   - session.id 从 stdin 读（MVP 实证与 OTel session.id 一致）
+ *   - 总耗时 < 3s（hooks 已设 timeout=3）
+ *   - 失败静默，绝不阻塞 CC
+ *   - session.id 从 stdin 读
+ *
+ * 节流（仅对 UserPromptSubmit）：
+ *   - 在 ~/.claude/cc-otel-state/sent-<sid>.flag 写 marker
+ *   - 5 分钟内同 sid 跳过 OTLP 上报，避免高频敲键狂发
+ *   - 5 分钟后过期允许重试，给丢包/瞬时故障留救命窗口
  */
 
 "use strict";
 
-const { execSync } = require("child_process");
+const { execFileSync } = require("child_process");
+const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const http = require("http");
 const https = require("https");
 const { URL } = require("url");
+
+// UserPromptSubmit 节流窗口：5 分钟
+const PROMPT_THROTTLE_MS = 5 * 60 * 1000;
 
 // -------- 环境变量读取 ----------
 
@@ -57,9 +71,11 @@ function readStdin() {
   });
 }
 
-function safeExec(cmd) {
+// 安全执行 git 命令：execFileSync 不走 shell，cwd 字符串不会被 /bin/sh 解释，
+// 杜绝 cwd 含 `"` / `$(...)` / 反引号 时的命令注入（C-2 修复）
+function safeGit(args) {
   try {
-    return execSync(cmd, {
+    return execFileSync("git", args, {
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 1000,
     })
@@ -84,16 +100,37 @@ function safeExec(cmd) {
 
     const cwd = input.cwd || process.cwd();
     const sessionId = input.session_id || input.sessionId || ""; // MVP 实证：stdin.session_id = OTel session.id
+    // CC 在 stdin 里告诉脚本是哪个 hook 触发的；UserPromptSubmit 走"兜底"分支
+    const isPromptFallback = input.hook_event_name === "UserPromptSubmit";
+
+    // 兜底路径节流：sid 维度 5 分钟最多一次（marker 文件 mtime 判断）。
+    // 失败重试窗口同时由此控制：marker 过期后允许下次 prompt 再发一次。
+    const stateDir = path.join(os.homedir(), ".claude", "cc-otel-state");
+    const markerPath = sessionId ? path.join(stateDir, `sent-${sessionId}.flag`) : null;
+    if (isPromptFallback && markerPath && fs.existsSync(markerPath)) {
+      try {
+        const mtime = fs.statSync(markerPath).mtimeMs;
+        if (Date.now() - mtime < PROMPT_THROTTLE_MS) {
+          process.exit(0);
+        }
+      } catch (_) {
+        // marker 状态读不到就当作过期，继续走上报
+      }
+    }
 
     const event = {
+      "tool_kind": "cc",
       "event.name": "hook_session_start",
       "event.timestamp": new Date().toISOString(),
       "session.id": sessionId,
+      // 服务端按此字段分流：session_start 走原 new/resume 逻辑；
+      // user_prompt_fallback 走"entry 已存在则仅补空字段"逻辑
+      "hook_kind": isPromptFallback ? "user_prompt_fallback" : "session_start",
       "cwd": cwd,
       "project.name": path.basename(cwd),
-      "git.remote": safeExec(`git -C "${cwd}" config --get remote.origin.url`) || "",
-      "git.user.email": safeExec(`git -C "${cwd}" config user.email`) || "",
-      "git.user.name": safeExec(`git -C "${cwd}" config user.name`) || "",
+      "git.remote": safeGit(["-C", cwd, "config", "--get", "remote.origin.url"]) || "",
+      "git.user.email": safeGit(["-C", cwd, "config", "user.email"]) || "",
+      "git.user.name": safeGit(["-C", cwd, "config", "user.name"]) || "",
       "hostname": os.hostname() || "",
       "data_source": "hook", // Collector 端用 insert 而非 upsert 以保留本标签
     };
@@ -161,6 +198,19 @@ function safeExec(cmd) {
 
     req.on("error", done);     // 失败静默退出
     req.on("timeout", () => { req.destroy(); done(); });
+
+    // 在真正发包前 touch marker 文件——把"已尝试上报"持久化下来，
+    // 让后续 5 分钟内的 UserPromptSubmit 跳过重复 POST。失败也照写，
+    // 因为 5 分钟后 marker 会过期允许重试，不会永久卡住。
+    if (markerPath) {
+      try {
+        fs.mkdirSync(stateDir, { recursive: true });
+        fs.writeFileSync(markerPath, "");
+      } catch (_) {
+        // marker 写入失败不阻塞上报
+      }
+    }
+
     req.write(payload);
     req.end();
 

@@ -1,8 +1,9 @@
 {
-  "name": "cc-otel-installer",
-  "version": "1.0.1",
-  "description": "One-shot installer for Claude Code OpenTelemetry forwarding. Writes settings.json env + SessionStart hook + collector endpoint in a single npx command.",
+  "name": "ai-otel-installer",
+  "version": "1.0.2",
+  "description": "One-shot installer for AI CLI OpenTelemetry forwarding. Writes Claude Code, Codex CLI, and Gemini CLI telemetry config in a single npx command.",
   "bin": {
+    "ai-otel-installer": "./cli.js",
     "cc-otel-installer": "./cli.js"
   },
   "main": "./cli.js",
@@ -19,7 +20,10 @@
   "license": "MIT",
   "author": "iFlyTek BG Productivity <productivity@iflytek.example>",
   "keywords": [
+    "ai-cli",
     "claude-code",
+    "codex",
+    "gemini",
     "claude",
     "observability",
     "opentelemetry",
@@ -30,12 +34,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/decent-yu/cc-otel-setup.git"
+    "url": "git+https://github.com/decent-yu/ai-otel-setup.git"
   },
   "bugs": {
-    "url": "https://github.com/decent-yu/cc-otel-setup/issues"
+    "url": "https://github.com/decent-yu/ai-otel-setup/issues"
   },
-  "homepage": "https://github.com/decent-yu/cc-otel-setup#readme",
+  "homepage": "https://github.com/decent-yu/ai-otel-setup#readme",
   "publishConfig": {
     "access": "public"
   }
