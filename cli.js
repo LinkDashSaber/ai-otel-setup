@@ -432,6 +432,15 @@ function main() {
   fs.copyFileSync(hookScriptSrc, hookScriptDest);
   fs.chmodSync(hookScriptDest, 0o755);
 
+  // v1.0.3：把 endpoint 写盘，给 hook 脚本的 resolveLogsEndpoint 当兜底。
+  // 修的是 v1.0.2 的真实事故：settings.json 的 env 不一定能继承到 hook 子进程
+  // （Windows / 已运行的 CC 实例都会踩到），导致 hook fallback 到 localhost
+  // 拿 ECONNREFUSED 静默失败、marker 已写但 POST 永不到达。
+  writeJSONAtomic(path.join(installDir, "endpoint.json"), {
+    endpoint,
+    logsEndpoint: logsEndpointFromGrpc(endpoint),
+  });
+
   const existing = readJSONSafe(settingsPath);
   const bak = backup(settingsPath);
   const merged = mergeSettings(

@@ -44,13 +44,30 @@ const PROMPT_THROTTLE_MS = 5 * 60 * 1000;
  * 优先级：
  *   1. 显式 OTEL_EXPORTER_OTLP_LOGS_ENDPOINT（用户指定 logs 端点）
  *   2. OTEL_EXPORTER_OTLP_ENDPOINT（通用端点，自动补 /v1/logs，把 4317 换成 4318）
- *   3. fallback http://localhost:4318/v1/logs
+ *   3. installer 写盘的 ~/.claude/cc-otel/endpoint.json（救 CC 父进程未传 env 的场景；
+ *      v1.0.2 实测 settings.json 的 env 不一定继承到 hook 子进程，导致 fallback 到
+ *      localhost 后 ECONNREFUSED 静默失败）
+ *   4. fallback http://localhost:4318/v1/logs
  */
 function resolveLogsEndpoint() {
   const logsEndpoint = process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT;
   if (logsEndpoint) return logsEndpoint;
 
-  const base = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || "http://localhost:4317";
+  let base = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+
+  // env 没拿到 → 读 installer 写的 endpoint.json
+  if (!base) {
+    try {
+      const cfgPath = path.join(os.homedir(), ".claude", "cc-otel", "endpoint.json");
+      const cfg = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+      if (cfg && cfg.logsEndpoint) return cfg.logsEndpoint;
+      if (cfg && cfg.endpoint) base = cfg.endpoint;
+    } catch (_) {
+      // 文件不存在或解析失败：继续走 localhost fallback，与历史行为一致
+    }
+  }
+
+  if (!base) base = "http://localhost:4317";
   const url = new URL(base);
   // gRPC 默认 4317 → OTLP/HTTP 默认 4318
   if (url.port === "4317") url.port = "4318";
