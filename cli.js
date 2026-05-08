@@ -164,6 +164,94 @@ function readGlobalGitUser() {
   };
 }
 
+// ---------- 装机上报到 cc-view-server ----------
+//
+// 安装完成时打一发 POST 到 cc-view-server，让运营侧能看到"谁/在哪台机/装了哪个版本"。
+// 设计原则：
+//   - fire-and-forget：3s 超时、不重试、任何失败绝不让安装本身退出非 0
+//   - 复用用户传给 OTel collector 的 host：172.31.250.57，port 8081 写死
+//   - URL 本身是公司内网地址，自带隐式凭据，不带 SSO header
+//   - debug 模式下才打错误，正常运行不污染 stdout
+
+function buildReportUrl(otelEndpoint) {
+  try {
+    const u = new URL(otelEndpoint);
+    // cc-view-server 跑在同机 :8081（与 collector 4317/4318 同主机）
+    return `http://${u.hostname}:8081/api/installer/report`;
+  } catch (_) {
+    return null;
+  }
+}
+
+function postJsonWithTimeout(targetUrl, payload, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try {
+      u = new URL(targetUrl);
+    } catch (e) {
+      return reject(e);
+    }
+    const isHttps = u.protocol === "https:";
+    const lib = isHttps ? require("https") : require("http");
+    const body = Buffer.from(JSON.stringify(payload), "utf8");
+    const req = lib.request(
+      {
+        method: "POST",
+        hostname: u.hostname,
+        port: u.port || (isHttps ? 443 : 80),
+        path: (u.pathname || "/") + (u.search || ""),
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": body.length,
+        },
+        timeout: timeoutMs,
+      },
+      (res) => {
+        // 排空 body，让 socket 进入 keepalive/释放
+        res.on("data", () => {});
+        res.on("end", () => resolve(res.statusCode || 0));
+        res.on("error", reject);
+      }
+    );
+    req.on("error", reject);
+    req.on("timeout", () => {
+      req.destroy(new Error("timeout"));
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
+async function reportInstall(otelEndpoint, gitUser, allResults, debug) {
+  if (!gitUser || !gitUser.email) {
+    if (debug) console.error("[ai-otel-setup] 跳过装机上报：无 git user.email");
+    return;
+  }
+  const reportUrl = buildReportUrl(otelEndpoint);
+  if (!reportUrl) return;
+  const findOk = (tool) =>
+    allResults.find((r) => r.tool === tool)?.status === "installed";
+  const payload = {
+    git_email: gitUser.email,
+    git_name: gitUser.name || "",
+    hostname: os.hostname(),
+    installer_version: PKG_VERSION,
+    os_platform: os.platform(),
+    os_arch: os.arch(),
+    node_version: process.version,
+    cc_cli_detected: findOk("claude") ? 1 : 0,
+    codex_cli_detected: findOk("codex") ? 1 : 0,
+  };
+  try {
+    await postJsonWithTimeout(reportUrl, payload, 3000);
+    if (debug) console.error("[ai-otel-setup] 装机上报已发送");
+  } catch (e) {
+    if (debug) {
+      console.error("[ai-otel-setup] 装机上报失败（不影响安装）:", e.message || e);
+    }
+  }
+}
+
 // ---------- OTEL_RESOURCE_ATTRIBUTES (W3C baggage 风格) ----------
 
 // "k1=urlencoded,k2=urlencoded2" → { k1: "decoded", k2: "decoded2" }
@@ -500,7 +588,7 @@ function installGemini(home, endpoint) {
 
 // ---------- 主流程 ----------
 
-function main() {
+async function main() {
   const args = parseArgs(process.argv.slice(2));
 
   if (args.help || args.h || process.argv.includes("--help")) {
@@ -636,6 +724,9 @@ function main() {
         "SessionStart 中 id=" + HOOK_ID + " 与 UserPromptSubmit 中 id=" + PROMPT_HOOK_ID + " 的条目。"
     );
   }
+
+  // 装机上报：fire-and-forget 语义，3s 内完成或放弃；任何错误都不冒泡
+  await reportInstall(endpoint, gitUser, allResults, debug);
 }
 
 function printUsage() {
@@ -650,9 +741,7 @@ function printUsage() {
 `);
 }
 
-try {
-  main();
-} catch (e) {
+main().catch((e) => {
   console.error("[ai-otel-setup] 失败：" + (e && e.message ? e.message : e));
   process.exit(1);
-}
+});
