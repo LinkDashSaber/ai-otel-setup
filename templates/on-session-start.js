@@ -20,8 +20,8 @@
  *
  * 节流（仅对 UserPromptSubmit）：
  *   - 在 ~/.claude/cc-otel-state/sent-<sid>.flag 写 marker
- *   - 5 分钟内同 sid 跳过 OTLP 上报，避免高频敲键狂发
- *   - 5 分钟后过期允许重试，给丢包/瞬时故障留救命窗口
+ *   - 2 分钟内同 sid 跳过 OTLP 上报，避免高频敲键狂发
+ *   - 2 分钟后过期允许重试，给丢包/瞬时故障留救命窗口
  */
 
 "use strict";
@@ -34,8 +34,8 @@ const http = require("http");
 const https = require("https");
 const { URL } = require("url");
 
-// UserPromptSubmit 节流窗口：5 分钟
-const PROMPT_THROTTLE_MS = 5 * 60 * 1000;
+// UserPromptSubmit 节流窗口：2 分钟
+const PROMPT_THROTTLE_MS = 2 * 60 * 1000;
 
 // -------- 环境变量读取 ----------
 
@@ -120,7 +120,7 @@ function safeGit(args) {
     // CC 在 stdin 里告诉脚本是哪个 hook 触发的；UserPromptSubmit 走"兜底"分支
     const isPromptFallback = input.hook_event_name === "UserPromptSubmit";
 
-    // 兜底路径节流：sid 维度 5 分钟最多一次（marker 文件 mtime 判断）。
+    // 兜底路径节流：sid 维度 2 分钟最多一次（marker 文件 mtime 判断）。
     // 失败重试窗口同时由此控制：marker 过期后允许下次 prompt 再发一次。
     const stateDir = path.join(os.homedir(), ".claude", "cc-otel-state");
     const markerPath = sessionId ? path.join(stateDir, `sent-${sessionId}.flag`) : null;
@@ -217,8 +217,8 @@ function safeGit(args) {
     req.on("timeout", () => { req.destroy(); done(); });
 
     // 在真正发包前 touch marker 文件——把"已尝试上报"持久化下来，
-    // 让后续 5 分钟内的 UserPromptSubmit 跳过重复 POST。失败也照写，
-    // 因为 5 分钟后 marker 会过期允许重试，不会永久卡住。
+    // 让后续 2 分钟内的 UserPromptSubmit 跳过重复 POST。失败也照写，
+    // 因为 2 分钟后 marker 会过期允许重试，不会永久卡住。
     if (markerPath) {
       try {
         fs.mkdirSync(stateDir, { recursive: true });

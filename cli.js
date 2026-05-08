@@ -475,7 +475,7 @@ function main() {
   };
 
   // UserPromptSubmit 兜底 hook：复用同一脚本，由 stdin.hook_event_name 在脚本内部
-  // 分流。客户端做 5 分钟节流，服务端见 entry 已存在则仅补空。用于救 SessionStart
+  // 分流。客户端做 2 分钟节流，服务端见 entry 已存在则仅补空。用于救 SessionStart
   // 因网络/超时丢失的场景（线上观测约 60% 事件因此空 git/hostname）。
   const promptHookEntry = {
     matcher: "*",
