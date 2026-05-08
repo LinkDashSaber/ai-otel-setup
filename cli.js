@@ -24,6 +24,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const { execFileSync } = require("child_process");
 
 const PKG_VERSION = require("./package.json").version;
 
@@ -131,6 +132,76 @@ function mergeNoProxy(existing, host) {
   return list.join(",");
 }
 
+// ---------- git config 兜底 (跨平台) ----------
+//
+// hook 进程偶有"压根没跑"的场景（网络/超时/进程崩溃），导致 git.user.email/name 永久丢失。
+// 装机时把全局 git config 写到 OTEL_RESOURCE_ATTRIBUTES，CC SDK 自动把 resource attr
+// 带到每条 metric/log，service 端在 SessionStore miss 时用它兜底（参见 translator.js
+// 的 RESOURCE_FALLBACK_KEYS）。
+//
+// 跨平台细节：
+//   - execFileSync(cmd, args)：不经过 shell，Win/Mac 行为一致
+//   - windowsHide:true：Windows 上不弹 cmd 黑窗
+//   - stdio[2]="ignore"：屏蔽 stderr，避免 git 报错刷屏
+//   - timeout:1000：超时直接当成"读不到"，不让 installer 卡住
+//   - ENOENT (git 没装) / 退出码非 0 (key 没设) 都吞掉返回空串
+function readGlobalGitUser() {
+  function readGitVal(key) {
+    try {
+      return execFileSync("git", ["config", "--global", "--get", key], {
+        encoding: "utf8",
+        windowsHide: true,
+        timeout: 1000,
+        stdio: ["ignore", "pipe", "ignore"],
+      }).trim();
+    } catch (_) {
+      return "";
+    }
+  }
+  return {
+    name: readGitVal("user.name"),
+    email: readGitVal("user.email"),
+  };
+}
+
+// ---------- OTEL_RESOURCE_ATTRIBUTES (W3C baggage 风格) ----------
+
+// "k1=urlencoded,k2=urlencoded2" → { k1: "decoded", k2: "decoded2" }
+function parseResourceAttrs(s) {
+  const out = {};
+  if (!s || typeof s !== "string") return out;
+  for (const pair of s.split(",")) {
+    const idx = pair.indexOf("=");
+    if (idx <= 0) continue;
+    const k = pair.slice(0, idx).trim();
+    if (!k) continue;
+    const raw = pair.slice(idx + 1).trim();
+    try {
+      out[k] = decodeURIComponent(raw);
+    } catch (_) {
+      out[k] = raw; // decode 失败原样保留，不抛
+    }
+  }
+  return out;
+}
+
+function serializeResourceAttrs(obj) {
+  const parts = [];
+  for (const [k, v] of Object.entries(obj)) {
+    if (v === "" || v === null || v === undefined) continue;
+    parts.push(`${k}=${encodeURIComponent(v)}`);
+  }
+  return parts.join(",");
+}
+
+// parse-merge-serialize：保留用户自定义 attr（如 region=us-east），仅注入/覆盖 git.user.*
+function mergeResourceAttrs(existing, gitUser) {
+  const attrs = parseResourceAttrs(existing || "");
+  if (gitUser.email) attrs["git.user.email"] = gitUser.email;
+  if (gitUser.name) attrs["git.user.name"] = gitUser.name;
+  return serializeResourceAttrs(attrs);
+}
+
 // ---------- 文件操作 ----------
 
 function readJSONSafe(p) {
@@ -164,12 +235,11 @@ function backup(p) {
 function buildEnv(template, args, endpoint) {
   const env = { ...template.env };
   env.OTEL_EXPORTER_OTLP_ENDPOINT = endpoint;
-  // OTEL_RESOURCE_ATTRIBUTES 已废弃：bg/dept/team 不再上报
-  delete env.OTEL_RESOURCE_ATTRIBUTES;
+  // OTEL_RESOURCE_ATTRIBUTES 由 mergeSettings 单独处理（parse-merge 用户已有 + 注入 git.user.*）
   return env;
 }
 
-function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, collectorHost) {
+function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, collectorHost, gitUser) {
   const merged = { ...existing };
 
   // env：plugin 优先（组织规范不允许个人改红线），但保留用户独有的 env
@@ -177,8 +247,14 @@ function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, collectorHo
   for (const k of OTEL_KEYS) {
     merged.env[k] = newEnv[k];
   }
-  // 清理历史遗留：旧版本 installer 写过 OTEL_RESOURCE_ATTRIBUTES，删掉
-  delete merged.env.OTEL_RESOURCE_ATTRIBUTES;
+
+  // OTEL_RESOURCE_ATTRIBUTES：parse-merge 用户已有 attr + 注入 git.user.email/name。
+  // 不进 OTEL_KEYS（OTEL_KEYS 走 overwrite，会丢掉用户自定义如 region=us-east）。
+  // 只在 readGlobalGitUser 拿到非空值时写；全空时保持用户已有值不动（包括不删）。
+  if (gitUser && (gitUser.name || gitUser.email)) {
+    const ra = mergeResourceAttrs(merged.env.OTEL_RESOURCE_ATTRIBUTES, gitUser);
+    if (ra) merged.env.OTEL_RESOURCE_ATTRIBUTES = ra;
+  }
 
   // 兜底用户写坏的 HTTP(S)_PROXY：把 collector host 加进 NO_PROXY，让 OTel gRPC 绕过代理
   // 仅追加，不动用户原有的 NO_PROXY 值，也不动 HTTP_PROXY / HTTPS_PROXY
@@ -505,6 +581,10 @@ function main() {
     logsEndpoint: logsEndpointFromGrpc(endpoint),
   });
 
+  // 读全局 git config，作为 hook 进程没跑时的 SDK 层兜底来源
+  // 失败/缺失返回空串；mergeSettings 见空就跳过 OTEL_RESOURCE_ATTRIBUTES 写入
+  const gitUser = readGlobalGitUser();
+
   const existing = readJSONSafe(settingsPath);
   const bak = backup(settingsPath);
   const merged = mergeSettings(
@@ -512,7 +592,8 @@ function main() {
     newEnv,
     hookEntry,
     promptHookEntry,
-    extractHost(endpoint)
+    extractHost(endpoint),
+    gitUser
   );
   writeJSONAtomic(settingsPath, merged);
 
