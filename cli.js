@@ -25,6 +25,8 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
+const PKG_VERSION = require("./package.json").version;
+
 const REQUIRED_KEYS = ["url"];
 const HOOK_ID = "team:session-start";
 // UserPromptSubmit 兜底 hook：复用同一脚本，靠 stdin.hook_event_name 分流；
@@ -469,6 +471,7 @@ function main() {
 
   console.log("[ai-otel-setup] 安装完成。");
   console.log("");
+  console.log(`  ${"version".padEnd(12)}: ${PKG_VERSION}`);
   console.log(`  ${"endpoint".padEnd(12)}: ${endpoint}`);
   for (const r of allResults) {
     console.log(`  ${r.tool.padEnd(12)}: ${r.status}${r.reason ? " (" + r.reason + ")" : ""}`);
