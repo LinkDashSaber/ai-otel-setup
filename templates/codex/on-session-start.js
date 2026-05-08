@@ -27,8 +27,17 @@ function safeGit(args) {
   }
 }
 
+// 解析 OTLP/HTTP logs endpoint。优先级：env 覆盖 → installer 写在 hook 同目录的
+// endpoint.json → localhost 兜底。原本走 shell 前缀 `AI_OTEL_LOGS_ENDPOINT=...` 注入
+// env，但那是 POSIX 独有语法、cmd.exe 把它当程序名就 G 了，所以 v1.0.4 起命令行
+// 不再带前缀，改让脚本自己读 endpoint.json，跨平台统一。env 留作 debug 覆盖口。
 function endpoint() {
-  return process.env.AI_OTEL_LOGS_ENDPOINT || "http://localhost:4318/v1/logs";
+  if (process.env.AI_OTEL_LOGS_ENDPOINT) return process.env.AI_OTEL_LOGS_ENDPOINT;
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, "endpoint.json"), "utf8"));
+    if (cfg && cfg.logsEndpoint) return cfg.logsEndpoint;
+  } catch (_) { /* 文件不存在/解析失败：继续走 localhost */ }
+  return "http://localhost:4318/v1/logs";
 }
 
 (async () => {

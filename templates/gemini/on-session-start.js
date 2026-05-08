@@ -4,6 +4,7 @@
 const { execFileSync } = require("child_process");
 const os = require("os");
 const path = require("path");
+const fs = require("fs");
 const http = require("http");
 const https = require("https");
 const { URL } = require("url");
@@ -16,8 +17,19 @@ function safeGit(args) {
   }
 }
 
+// 解析 OTLP/HTTP logs endpoint。优先级：env 覆盖 → installer 写在 hook 同目录的
+// endpoint.json → localhost 兜底。v1.0.4 起 hook 自己读 endpoint.json，避免依赖
+// shell 前缀注入 env 那种 POSIX-only 写法（cmd.exe 不认）。
 function endpoint() {
-  const base = process.env.GEMINI_TELEMETRY_OTLP_ENDPOINT || "http://localhost:4317";
+  let base = process.env.GEMINI_TELEMETRY_OTLP_ENDPOINT;
+  if (!base) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, "endpoint.json"), "utf8"));
+      if (cfg && cfg.logsEndpoint) return cfg.logsEndpoint;
+      if (cfg && cfg.endpoint) base = cfg.endpoint;
+    } catch (_) { /* 文件不存在/解析失败：继续走 localhost */ }
+  }
+  if (!base) base = "http://localhost:4317";
   const url = new URL(base);
   if (url.port === "4317") url.port = "4318";
   if (!url.pathname || url.pathname === "/") url.pathname = "/v1/logs";
