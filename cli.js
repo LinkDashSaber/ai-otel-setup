@@ -27,6 +27,26 @@ const os = require("os");
 
 const PKG_VERSION = require("./package.json").version;
 
+// 安装时这台机器的 node 绝对路径，给 hook 命令做兜底（见 buildHookCommand）。
+const NODE_BIN = process.execPath;
+
+// 跨平台 hook 命令：固定形式 `<NODE_BIN> <launcher> <hook>`，三段都是绝对路径，
+// 对 shell 完全透明（POSIX sh / cmd.exe / PowerShell 5.1+ / PowerShell 7+ 全 cover）。
+// "PATH 上 node 优先 → 否则用 baked 绝对路径" 的兜底逻辑放在 launch-hook.js 里做，
+// 不再依赖 shell `||` 操作符——PS 5.1 不支持 `||`，cc/gemini 在 Windows 上默认就
+// 是 PS，会被坑。
+function buildHookCommand(launcherPath, scriptPath) {
+  return `"${NODE_BIN}" "${launcherPath}" "${scriptPath}"`;
+}
+
+// 把 launcher 模板拷到 hook 同目录，返回 launcher 的绝对路径
+function installLauncher(installDir) {
+  const launcherDest = path.join(installDir, "launch-hook.js");
+  fs.copyFileSync(path.join(__dirname, "templates", "launch-hook.js"), launcherDest);
+  fs.chmodSync(launcherDest, 0o755);
+  return launcherDest;
+}
+
 const REQUIRED_KEYS = ["url"];
 const HOOK_ID = "team:session-start";
 // UserPromptSubmit 兜底 hook：复用同一脚本，靠 stdin.hook_event_name 分流；
@@ -258,7 +278,35 @@ function stripLegacyCodexHook(text) {
   );
 }
 
-function buildCodexManagedBlock(endpoint, hookDest, logsEndpoint) {
+function stripLegacyCodexHooksFlag(text) {
+  // Codex 把 [features].codex_hooks 重命名为 [features].hooks，旧 key 启动时触发 deprecation 警告
+  // 删 = true 这行，由 ensureFeaturesHooksTrue 统一写 hooks = true；= false 是显式 opt-out，保留
+  return text.replace(/^[ \t]*codex_hooks[ \t]*=[ \t]*true[ \t]*\r?\n/gm, "");
+}
+
+function ensureFeaturesHooksTrue(text) {
+  // 在用户已有的 [features] 块原地插入 hooks = true（如缺失）；没有 [features] 就新建。
+  // 不能写在 managed 块里——TOML 1.0 禁止同名 table 重复声明，会被严格解析器拒绝。
+  const lines = text.split(/\r?\n/);
+  let featuresIdx = -1;
+  let hooksKeyExists = false;
+  for (let i = 0; i < lines.length; i++) {
+    if (featuresIdx === -1) {
+      if (/^\s*\[features\]\s*$/.test(lines[i])) featuresIdx = i;
+      continue;
+    }
+    if (/^\s*\[/.test(lines[i])) break; // 下一个 section，结束 [features] 主块扫描
+    if (/^[ \t]*hooks[ \t]*=/.test(lines[i])) hooksKeyExists = true;
+  }
+  if (featuresIdx >= 0) {
+    if (hooksKeyExists) return text; // 任何 hooks = ... 都尊重，不覆盖用户显式选择
+    lines.splice(featuresIdx + 1, 0, "hooks = true");
+    return lines.join("\n");
+  }
+  return text.trimEnd() + "\n\n[features]\nhooks = true\n";
+}
+
+function buildCodexManagedBlock(endpoint, hookDest, launcherDest) {
   // exporter / trace_exporter / metrics_exporter 是 externally-tagged enum：
   //   - 写 scalar `exporter = "otlp-grpc"`：codex 解析为 unit variant，因为
   //     OtlpGrpc 是 struct variant（带 endpoint 等字段），报
@@ -267,11 +315,9 @@ function buildCodexManagedBlock(endpoint, hookDest, logsEndpoint) {
   //   - 只写 table `[otel.exporter."otlp-grpc"]`：✓ codex 把它解析为
   //     OtlpGrpc { endpoint }，tag 来自 key 名。
   // 官方 sample 之所以能 `exporter = "none"`，是因为 None 本身就是 unit variant。
+  // [features].hooks = true 由 ensureFeaturesHooksTrue 写到用户块里，避免重复声明 [features]
   return [
     CODEX_MANAGED_BEGIN,
-    "[features]",
-    "codex_hooks = true",
-    "",
     "[otel]",
     'environment = "prod"',
     "log_user_prompt = false",
@@ -290,7 +336,7 @@ function buildCodexManagedBlock(endpoint, hookDest, logsEndpoint) {
     "",
     "[[hooks.SessionStart.hooks]]",
     'type = "command"',
-    `command = ${JSON.stringify(`AI_OTEL_LOGS_ENDPOINT=${logsEndpoint} node "${hookDest}"`)}`,
+    `command = ${JSON.stringify(buildHookCommand(launcherDest, hookDest))}`,
     CODEX_MANAGED_END,
   ].join("\n");
 }
@@ -306,16 +352,24 @@ function installCodex(home, endpoint) {
   fs.mkdirSync(installDir, { recursive: true });
   fs.copyFileSync(path.join(__dirname, "templates", "codex", "on-session-start.js"), hookDest);
   fs.chmodSync(hookDest, 0o755);
+  const launcherDest = installLauncher(installDir);
   const bak = backup(configPath);
   let existing = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
 
-  // 三步去重：先剥离上一次的 managed 块，再清掉旧 schema 残留
+  // 先剥离上一次的 managed 块和旧 schema 残留，再保证用户块里有 hooks = true
   existing = stripCodexManagedBlock(existing);
   existing = stripLegacyCodexOtel(existing);
   existing = stripLegacyCodexHook(existing);
+  existing = stripLegacyCodexHooksFlag(existing);
+  existing = ensureFeaturesHooksTrue(existing);
 
-  const logsEndpoint = logsEndpointFromGrpc(endpoint);
-  const managed = buildCodexManagedBlock(endpoint, hookDest, logsEndpoint);
+  // hook 同目录的 endpoint.json：hook 脚本运行时读它拿 logs endpoint，避免依赖
+  // shell 前缀注入 env（cmd.exe 不认那种语法，跨平台必须改成走文件）。
+  writeJSONAtomic(path.join(installDir, "endpoint.json"), {
+    endpoint,
+    logsEndpoint: logsEndpointFromGrpc(endpoint),
+  });
+  const managed = buildCodexManagedBlock(endpoint, hookDest, launcherDest);
   const merged = (existing.trimEnd() + "\n\n" + managed + "\n").replace(/\n{3,}/g, "\n\n");
   fs.writeFileSync(configPath, merged, "utf8");
   return { tool: "codex", status: "installed", path: configPath, backup: bak };
@@ -332,6 +386,12 @@ function installGemini(home, endpoint) {
   fs.mkdirSync(installDir, { recursive: true });
   fs.copyFileSync(path.join(__dirname, "templates", "gemini", "on-session-start.js"), hookDest);
   fs.chmodSync(hookDest, 0o755);
+  const launcherDest = installLauncher(installDir);
+  // 同 Codex：endpoint.json 给 hook 脚本读，跨平台不依赖 env 前缀。
+  writeJSONAtomic(path.join(installDir, "endpoint.json"), {
+    endpoint,
+    logsEndpoint: logsEndpointFromGrpc(endpoint),
+  });
   const existing = readJSONSafe(settingsPath);
   const bak = backup(settingsPath);
   const merged = { ...existing };
@@ -352,7 +412,7 @@ function installGemini(home, endpoint) {
     : [];
   const hookEntry = {
     id: HOOK_ID,
-    command: `node "${hookDest}"`,
+    command: buildHookCommand(launcherDest, hookDest),
   };
   const idx = sessionStart.findIndex((h) => h && h.id === HOOK_ID);
   if (idx >= 0) sessionStart[idx] = hookEntry;
@@ -386,6 +446,7 @@ function main() {
   const installDir = path.join(claudeDir, "cc-otel");
   const settingsPath = path.join(claudeDir, "settings.json");
   const hookScriptDest = path.join(installDir, "on-session-start.js");
+  const launcherDest = path.join(installDir, "launch-hook.js");
 
   const templateDir = path.join(__dirname, "templates");
   const settingsTemplate = readJSONSafe(path.join(templateDir, "settings.template.json"));
@@ -404,7 +465,7 @@ function main() {
     hooks: [
       {
         type: "command",
-        command: `node "${hookScriptDest}"`,
+        command: buildHookCommand(launcherDest, hookScriptDest),
         timeout: 3,
       },
     ],
@@ -421,7 +482,7 @@ function main() {
     hooks: [
       {
         type: "command",
-        command: `node "${hookScriptDest}"`,
+        command: buildHookCommand(launcherDest, hookScriptDest),
         timeout: 3,
       },
     ],
@@ -433,6 +494,7 @@ function main() {
   fs.mkdirSync(installDir, { recursive: true });
   fs.copyFileSync(hookScriptSrc, hookScriptDest);
   fs.chmodSync(hookScriptDest, 0o755);
+  installLauncher(installDir);
 
   // v1.0.3：把 endpoint 写盘，给 hook 脚本的 resolveLogsEndpoint 当兜底。
   // 修的是 v1.0.2 的真实事故：settings.json 的 env 不一定能继承到 hook 子进程
