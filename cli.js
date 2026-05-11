@@ -28,15 +28,38 @@ const { execFileSync } = require("child_process");
 
 const PKG_VERSION = require("./package.json").version;
 
-// 安装时这台机器的 node 绝对路径，给 hook 命令做兜底（见 buildHookCommand）。
+// 安装时这台机器的 node 绝对路径，POSIX 上拿来构造 hook command 用。
+// Windows 上不再写 node 绝对路径（见 buildHookCommand 注释）。
 const NODE_BIN = process.execPath;
 
-// 跨平台 hook 命令：固定形式 `<NODE_BIN> <launcher> <hook>`，三段都是绝对路径，
-// 对 shell 完全透明（POSIX sh / cmd.exe / PowerShell 5.1+ / PowerShell 7+ 全 cover）。
-// "PATH 上 node 优先 → 否则用 baked 绝对路径" 的兜底逻辑放在 launch-hook.js 里做，
-// 不再依赖 shell `||` 操作符——PS 5.1 不支持 `||`，cc/gemini 在 Windows 上默认就
-// 是 PS，会被坑。
+// 跨平台 hook 命令构造。
+//
+// **Windows 上的关键决策（v1.0.9 重构）**：不再写 node 绝对路径，也不再加引号，
+// 让 shell 自己按空白 split + 用 PATH lookup node。原因：
+//   - 写绝对路径如 "C:\Program Files\nodejs\node.exe"，PowerShell 5.1（cc/gemini
+//     在 Windows 默认 shell）解析时会把外层引号脱掉，按空白把 "C:\Program" 切成
+//     一个 token，"Files\nodejs\..." 切成另一个，hook 进程起不来，exit code 1。
+//   - 用 8.3 短路径 (C:\Progra~1\...) 在 NTFS 8dot3name 禁用的卷上失效，
+//     更糟的是 cmd /c for 在某些 locale 下输出会带额外引号，被 installer
+//     二次拼装成 ""\"C:\\\"C:\\Program Files\\nodejs\\node.exe\\\"\"" 这种
+//     非法嵌套，比原 bug 更难修。
+//   - 改写 wrapper .cmd / .sh 让用户用别的 shell 接管 → 整体复杂度+30 行，
+//     而且 wrapper 路径本身仍可能带空格，治标不治本。
+//
+// 务实最稳的解：让 shell 自己 PATH 找 node，命令字符串本身不含空格路径段。
+// 假设 ~/.codex/ai-otel/ 这条路径不含空格（取决于用户名）：
+//   - 99% 用户名是 ASCII 无空格 → 完美工作
+//   - 用户名带空格的极少数（如 "John Smith"）→ 文档化处理（见
+//     docs/codex-windows-troubleshooting.md "用户名含空格" 一节）
+//
+// launch-hook.js 内部还会再做一次 PATH 上探 node、失败时 fallback baked
+// execPath 的兜底，所以 PATH 上 node 临时失踪也能起来。
+//
+// POSIX：保持 quoted 三段格式，shell 行为统一，路径有空格也安全。
 function buildHookCommand(launcherPath, scriptPath) {
+  if (process.platform === "win32") {
+    return `node ${launcherPath} ${scriptPath}`;
+  }
   return `"${NODE_BIN}" "${launcherPath}" "${scriptPath}"`;
 }
 
