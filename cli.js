@@ -187,24 +187,18 @@ function readGlobalGitUser() {
   };
 }
 
-// ---------- 装机上报到 cc-view-server ----------
+// ---------- 装机上报：走同一条 OTel 管线 ----------
 //
-// 安装完成时打一发 POST 到 cc-view-server，让运营侧能看到"谁/在哪台机/装了哪个版本"。
+// 历史：原 POST 到 cc-view-server :8081/api/installer/report 直写 Doris。
+// otel-prod 部署到公网、cc-view-web 留在内网后，installer 只能跟 OTel collector
+// 说话；改成发一条 OTLP/HTTP log（event.name = installer_register），由 forwarder
+// 走同一条管线落到 iData，cc-view-server 端从事件表 reduce 出装机记录。
+// 这样 installer 命令依旧只暴露一个 url，跟数据上报完全同源。
+//
 // 设计原则：
-//   - fire-and-forget：3s 超时、不重试、任何失败绝不让安装本身退出非 0
-//   - 复用用户传给 OTel collector 的 host：172.31.250.57，port 8081 写死
-//   - URL 本身是公司内网地址，自带隐式凭据，不带 SSO header
+//   - fire-and-forget：2.5s 超时、不重试、任何失败绝不让安装本身退出非 0
+//   - 复用 logsEndpointFromGrpc：4317 → 4318，path 自动补 /v1/logs
 //   - debug 模式下才打错误，正常运行不污染 stdout
-
-function buildReportUrl(otelEndpoint) {
-  try {
-    const u = new URL(otelEndpoint);
-    // cc-view-server 跑在同机 :8081（与 collector 4317/4318 同主机）
-    return `http://${u.hostname}:8081/api/installer/report`;
-  } catch (_) {
-    return null;
-  }
-}
 
 function postJsonWithTimeout(targetUrl, payload, timeoutMs) {
   return new Promise((resolve, reject) => {
@@ -250,24 +244,56 @@ async function reportInstall(otelEndpoint, gitUser, allResults, debug) {
     if (debug) console.error("[ai-otel-setup] 跳过装机上报：无 git user.email");
     return;
   }
-  const reportUrl = buildReportUrl(otelEndpoint);
-  if (!reportUrl) return;
+  const logsUrl = logsEndpointFromGrpc(otelEndpoint);
+  if (!logsUrl) return;
   const findOk = (tool) =>
     allResults.find((r) => r.tool === tool)?.status === "installed";
-  const payload = {
-    git_email: gitUser.email,
-    git_name: gitUser.name || "",
-    hostname: os.hostname(),
-    installer_version: PKG_VERSION,
-    os_platform: os.platform(),
-    os_arch: os.arch(),
-    node_version: process.version,
-    cc_cli_detected: findOk("claude") ? 1 : 0,
-    codex_cli_detected: findOk("codex") ? 1 : 0,
+
+  // OTLP/HTTP log record。translator (lib/translate/installer_register.js) 按
+  // event.name = "installer_register" 路由到对应 eid，把 git.user.* / hostname
+  // 经 contextBlocksFromAttrs 落进 user 块，installer_* / os_* / node_version /
+  // *_cli_detected 走 phase1UdmapFields 白名单进 udmap。
+  const sessionId = `installer-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+  const attrs = {
+    "tool_kind": "installer",
+    "event.name": "installer_register",
+    "event.timestamp": new Date().toISOString(),
+    "session.id": sessionId,
+    "git.user.email": gitUser.email,
+    "git.user.name": gitUser.name || "",
+    "hostname": os.hostname() || "",
+    "installer_version": PKG_VERSION,
+    "os_platform": os.platform(),
+    "os_arch": os.arch(),
+    "node_version": process.version,
+    "cc_cli_detected": findOk("claude") ? "1" : "0",
+    "codex_cli_detected": findOk("codex") ? "1" : "0",
   };
+  const payload = {
+    resourceLogs: [
+      {
+        resource: { attributes: [] },
+        scopeLogs: [
+          {
+            logRecords: [
+              {
+                timeUnixNano: `${Date.now()}000000`,
+                body: { stringValue: "installer_register" },
+                attributes: Object.entries(attrs).map(([k, v]) => ({
+                  key: k,
+                  value: { stringValue: String(v ?? "") },
+                })),
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
   try {
-    await postJsonWithTimeout(reportUrl, payload, 3000);
-    if (debug) console.error("[ai-otel-setup] 装机上报已发送");
+    await postJsonWithTimeout(logsUrl, payload, 2500);
+    if (debug) console.error("[ai-otel-setup] 装机上报已发送 →", logsUrl);
   } catch (e) {
     if (debug) {
       console.error("[ai-otel-setup] 装机上报失败（不影响安装）:", e.message || e);
