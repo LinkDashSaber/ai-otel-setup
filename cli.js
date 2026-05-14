@@ -24,6 +24,7 @@
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
+const net = require("net");
 const { execFileSync } = require("child_process");
 
 const PKG_VERSION = require("./package.json").version;
@@ -127,13 +128,40 @@ function validateArgs(args) {
 
 // ---------- url → endpoint ----------
 
+function isIpHost(host) {
+  return net.isIP(String(host || "").replace(/^\[|\]$/g, "")) !== 0;
+}
+
+function bracketIpv6Host(host) {
+  const normalized = String(host || "").replace(/^\[|\]$/g, "");
+  return normalized.includes(":") ? `[${normalized}]` : normalized;
+}
+
+function formatRootUrl(protocol, host, port) {
+  return `${protocol}//${bracketIpv6Host(host)}${port ? ":" + port : ""}`;
+}
+
 function resolveEndpoint(rawUrl) {
-  // 用户传裸 IP 或 host：自动补 http:// 和 :4317（gRPC 默认端口）
-  // 用户传完整 URL：直接采用
-  if (/^https?:\/\//i.test(rawUrl)) return rawUrl;
-  // 如果用户已带端口（如 "1.2.3.4:4317"），保留；否则补默认 4317
-  const hasPort = /:\d+$/.test(rawUrl);
-  return `http://${rawUrl}${hasPort ? "" : ":4317"}`;
+  const input = String(rawUrl || "").trim();
+
+  // 用户传完整 URL：保留显式 protocol/port/path；仅在未写 port 时按 IP/域名补默认 gRPC 端口。
+  if (/^https?:\/\//i.test(input)) {
+    const url = new URL(input);
+    if (!url.port) url.port = isIpHost(url.hostname) ? "4317" : "24317";
+    if (url.pathname === "/" && !url.search && !url.hash) {
+      return formatRootUrl(url.protocol, url.hostname, url.port);
+    }
+    return url.toString();
+  }
+
+  // 用户传裸地址：
+  //   - IP：本地/内网测试形态，OTLP/gRPC = http://IP:4317
+  //   - 域名：生产公网形态，OTLP/gRPC = https://DOMAIN:24317
+  // 判断只看地址形态，不写入任何具体 host。
+  const url = new URL(`http://${input}`);
+  const isIp = isIpHost(url.hostname);
+  const port = url.port || (isIp ? "4317" : "24317");
+  return formatRootUrl(isIp ? "http:" : "https:", url.hostname, port);
 }
 
 function extractHost(endpoint) {
@@ -427,10 +455,20 @@ function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, collectorHo
 
 function logsEndpointFromGrpc(endpoint) {
   try {
-    const url = new URL(endpoint);
-    if (url.port === "4317") url.port = "4318";
-    if (!url.pathname || url.pathname === "/") url.pathname = "/v1/logs";
-    return url.toString();
+    const grpcUrl = new URL(endpoint);
+    const isIp = isIpHost(grpcUrl.hostname);
+    const logsUrl = new URL(`${isIp ? "http:" : "https:"}//${bracketIpv6Host(grpcUrl.hostname)}`);
+
+    if (isIp) {
+      logsUrl.port = !grpcUrl.port || grpcUrl.port === "4317" ? "4318" : grpcUrl.port;
+    } else if (grpcUrl.port && grpcUrl.port !== "24317") {
+      logsUrl.port = grpcUrl.port;
+    }
+
+    logsUrl.pathname =
+      !grpcUrl.pathname || grpcUrl.pathname === "/" ? "/v1/logs" : grpcUrl.pathname;
+    logsUrl.search = grpcUrl.search;
+    return logsUrl.toString();
   } catch (_) {
     return "http://localhost:4318/v1/logs";
   }
@@ -783,7 +821,7 @@ function printUsage() {
   npx -y ai-otel-setup url=COLLECTOR_HOST
 
 参数（必填）：
-  url    Collector host（裸 IP/域名，自动补 http://...:4317；也可传完整 URL）
+  url    Collector host（裸 IP 自动补 http://...:4317；裸域名自动补 https://...:24317；也可传完整 URL）
 
 可选：
   debug=1 | --debug   显示安装路径、备份路径与卸载提示
