@@ -173,6 +173,21 @@ function extractHost(endpoint) {
   }
 }
 
+function displayEndpoint(endpoint) {
+  try {
+    const url = new URL(endpoint);
+    if (!isIpHost(url.hostname)) {
+      // 生产域名的真实 gRPC 端口只写入配置，不在安装完成日志里暴露。
+      url.port = "";
+      if (url.pathname === "/" && !url.search && !url.hash) return url.origin;
+      return url.toString();
+    }
+  } catch (_) {
+    // 展示失败时沿用原值，不影响安装。
+  }
+  return endpoint;
+}
+
 function mergeNoProxy(existing, host) {
   // 合并保留用户已有 NO_PROXY 值，仅追加 collector host，去重保序
   const list = (existing || "")
@@ -790,7 +805,7 @@ async function main() {
   console.log("[ai-otel-setup] 安装完成。");
   console.log("");
   console.log(`  ${"version".padEnd(12)}: ${PKG_VERSION}`);
-  console.log(`  ${"endpoint".padEnd(12)}: ${endpoint}`);
+  console.log(`  ${"endpoint".padEnd(12)}: ${displayEndpoint(endpoint)}`);
   for (const r of allResults) {
     console.log(`  ${r.tool.padEnd(12)}: ${r.status}${r.reason ? " (" + r.reason + ")" : ""}`);
   }
