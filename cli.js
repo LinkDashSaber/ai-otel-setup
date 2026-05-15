@@ -489,6 +489,15 @@ function logsEndpointFromGrpc(endpoint) {
   }
 }
 
+function buildEndpointConfig(endpoint) {
+  return {
+    endpoint,
+    logsEndpoint: logsEndpointFromGrpc(endpoint),
+    installerVersion: PKG_VERSION,
+    packageName: "ai-otel-setup",
+  };
+}
+
 // ---------- Codex config.toml 处理 ----------
 //
 // 真实 schema（参见 https://developers.openai.com/codex/config-reference 与 /codex/hooks）：
@@ -631,10 +640,7 @@ function installCodex(home, endpoint) {
 
   // hook 同目录的 endpoint.json：hook 脚本运行时读它拿 logs endpoint，避免依赖
   // shell 前缀注入 env（cmd.exe 不认那种语法，跨平台必须改成走文件）。
-  writeJSONAtomic(path.join(installDir, "endpoint.json"), {
-    endpoint,
-    logsEndpoint: logsEndpointFromGrpc(endpoint),
-  });
+  writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint));
   const managed = buildCodexManagedBlock(endpoint, hookDest, launcherDest);
   const merged = (existing.trimEnd() + "\n\n" + managed + "\n").replace(/\n{3,}/g, "\n\n");
   fs.writeFileSync(configPath, merged, "utf8");
@@ -654,10 +660,7 @@ function installGemini(home, endpoint) {
   fs.chmodSync(hookDest, 0o755);
   const launcherDest = installLauncher(installDir);
   // 同 Codex：endpoint.json 给 hook 脚本读，跨平台不依赖 env 前缀。
-  writeJSONAtomic(path.join(installDir, "endpoint.json"), {
-    endpoint,
-    logsEndpoint: logsEndpointFromGrpc(endpoint),
-  });
+  writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint));
   const existing = readJSONSafe(settingsPath);
   const bak = backup(settingsPath);
   const merged = { ...existing };
@@ -766,10 +769,7 @@ async function main() {
   // 修的是 v1.0.2 的真实事故：settings.json 的 env 不一定能继承到 hook 子进程
   // （Windows / 已运行的 CC 实例都会踩到），导致 hook fallback 到 localhost
   // 拿 ECONNREFUSED 静默失败、marker 已写但 POST 永不到达。
-  writeJSONAtomic(path.join(installDir, "endpoint.json"), {
-    endpoint,
-    logsEndpoint: logsEndpointFromGrpc(endpoint),
-  });
+  writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint));
 
   // 读全局 git config，作为 hook 进程没跑时的 SDK 层兜底来源
   // 失败/缺失返回空串；mergeSettings 见空就跳过 OTEL_RESOURCE_ATTRIBUTES 写入
