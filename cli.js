@@ -673,6 +673,7 @@ function installGemini(home, endpoint) {
     target: "local",
     otlpEndpoint: endpoint,
     otlpProtocol: "grpc",
+    useCollector: true,
     logPrompts: false,
   };
   merged.hooks = { ...(existing.hooks || {}) };
