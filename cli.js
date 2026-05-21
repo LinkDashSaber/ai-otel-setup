@@ -47,19 +47,23 @@ const NODE_BIN = process.execPath;
 //   - 改写 wrapper .cmd / .sh 让用户用别的 shell 接管 → 整体复杂度+30 行，
 //     而且 wrapper 路径本身仍可能带空格，治标不治本。
 //
-// 务实最稳的解：让 shell 自己 PATH 找 node，命令字符串本身不含空格路径段。
-// 假设 ~/.codex/ai-otel/ 这条路径不含空格（取决于用户名）：
-//   - 99% 用户名是 ASCII 无空格 → 完美工作
-//   - 用户名带空格的极少数（如 "John Smith"）→ 文档化处理（见
-//     docs/codex-windows-troubleshooting.md "用户名含空格" 一节）
+// 务实最稳的解：让 shell 自己 PATH 找 node；两个 JS 路径作为 node 参数传入。
+// Windows 下统一把反斜杠改成正斜杠：
+//   - cmd / PowerShell / Node 都能识别 C:/Users/... 路径
+//   - Git Bash / bash 不会再把 C:\Users\... 里的反斜杠当转义字符吃掉
+// 参数路径加双引号，兼容用户名含空格的常见场景。
 //
 // launch-hook.js 内部还会再做一次 PATH 上探 node、失败时 fallback baked
 // execPath 的兜底，所以 PATH 上 node 临时失踪也能起来。
 //
 // POSIX：保持 quoted 三段格式，shell 行为统一，路径有空格也安全。
+function windowsNodeArg(p) {
+  return `"${String(p).replace(/\\/g, "/")}"`;
+}
+
 function buildHookCommand(launcherPath, scriptPath) {
   if (process.platform === "win32") {
-    return `node ${launcherPath} ${scriptPath}`;
+    return `node ${windowsNodeArg(launcherPath)} ${windowsNodeArg(scriptPath)}`;
   }
   return `"${NODE_BIN}" "${launcherPath}" "${scriptPath}"`;
 }
