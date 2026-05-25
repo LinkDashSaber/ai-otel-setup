@@ -16,7 +16,7 @@ const fs = require("fs");
 const path = require("path");
 
 const PACKAGE_NAME = "ai-otel-setup";
-const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const UPDATE_CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000;
 const UPDATE_RETRY_INTERVAL_MS = 10 * 60 * 1000;
 
 function readJSONSafe(file) {

@@ -731,6 +731,13 @@ async function main() {
     process.exit(1);
   }
 
+  // git user.email 是用户识别与装机上报的必需字段；缺失时不继续写入任何配置。
+  const gitUser = readGlobalGitUser();
+  if (!gitUser.email) {
+    console.error("[ai-otel-setup] 安装失败：未检测到全局 git user.email。");
+    process.exit(1);
+  }
+
   const endpoint = resolveEndpoint(args.url);
   const newEnv = buildEnv(settingsTemplate, args, endpoint);
 
@@ -775,10 +782,6 @@ async function main() {
   // （Windows / 已运行的 CC 实例都会踩到），导致 hook fallback 到 localhost
   // 拿 ECONNREFUSED 静默失败、marker 已写但 POST 永不到达。
   writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint));
-
-  // 读全局 git config，作为 hook 进程没跑时的 SDK 层兜底来源
-  // 失败/缺失返回空串；mergeSettings 见空就跳过 OTEL_RESOURCE_ATTRIBUTES 写入
-  const gitUser = readGlobalGitUser();
 
   const existing = readJSONSafe(settingsPath);
   const bak = backup(settingsPath);
