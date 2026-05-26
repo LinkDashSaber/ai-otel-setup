@@ -77,13 +77,14 @@ function installLauncher(installDir) {
   return launcherDest;
 }
 
-function writeInstallLog(installDir, tool, endpoint) {
+function writeInstallLog(installDir, tool, endpoint, otelTransport) {
   try {
     const { logEvent } = require(path.join(installDir, "logging.js"));
     logEvent("installer_complete", {
       tool,
       installerVersion: PKG_VERSION,
       endpoint: displayEndpoint(endpoint),
+      otelTransport,
     });
   } catch (_) {
     // Logging must never break installation.
@@ -101,6 +102,10 @@ const OTEL_KEYS = [
   "OTEL_LOGS_EXPORTER",
   "OTEL_EXPORTER_OTLP_PROTOCOL",
   "OTEL_EXPORTER_OTLP_ENDPOINT",
+  "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL",
+  "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT",
+  "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL",
+  "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
   "OTEL_LOGS_EXPORT_INTERVAL",
   "OTEL_METRIC_EXPORT_INTERVAL",
   "OTEL_METRICS_INCLUDE_VERSION",
@@ -116,6 +121,10 @@ function parseArgs(argv) {
   const out = {};
   const flat = [];
   for (const a of argv) {
+    if (/^--?[a-z][a-z0-9-]*$/i.test(a)) {
+      flat.push(a.replace(/^--?/, "") + "=true");
+      continue;
+    }
     // 兼容 url=x 单 argv 与 url=x 多 argv（保留逗号分隔，便于未来扩展）
     for (const part of a.split(",")) {
       if (part.trim()) flat.push(part.trim());
@@ -142,6 +151,11 @@ function validateArgs(args) {
     if (args[k].includes(",")) errs.push(`${k} 不允许包含逗号: "${args[k]}"`);
   }
   return errs;
+}
+
+function truthyFlag(value) {
+  if (value === true) return true;
+  return /^(1|true|yes|on)$/i.test(String(value || ""));
 }
 
 // ---------- url → endpoint ----------
@@ -182,6 +196,22 @@ function resolveEndpoint(rawUrl) {
   return formatRootUrl(isIp ? "http:" : "https:", url.hostname, port);
 }
 
+function httpRootEndpointFromLogs(logsEndpoint) {
+  const url = new URL(logsEndpoint);
+  url.pathname = "/";
+  url.search = "";
+  url.hash = "";
+  return url.origin;
+}
+
+function metricsEndpointFromLogs(logsEndpoint) {
+  const url = new URL(logsEndpoint);
+  url.pathname = "/v1/metrics";
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
 function extractHost(endpoint) {
   // 从已 resolve 的 endpoint 取 host（不带端口），用于 NO_PROXY
   try {
@@ -206,16 +236,26 @@ function displayEndpoint(endpoint) {
   return endpoint;
 }
 
-function buildNoProxyEntries(endpoint) {
+function appendNoProxyUrlEntries(entries, endpoint) {
   try {
     const url = new URL(endpoint);
-    const entries = [url.hostname];
-    if (url.port) entries.push(`${url.hostname}:${url.port}`);
-    return entries;
+    if (!entries.includes(url.hostname)) entries.push(url.hostname);
+    const port = url.port || (url.protocol === "https:" ? "443" : url.protocol === "http:" ? "80" : "");
+    const hostPort = port ? `${url.hostname}:${port}` : "";
+    if (hostPort && !entries.includes(hostPort)) entries.push(hostPort);
   } catch (_) {
     const host = extractHost(endpoint);
-    return host ? [host] : [];
+    if (host && !entries.includes(host)) entries.push(host);
   }
+}
+
+function buildNoProxyEntries(endpoint, otelTransport) {
+  const entries = [];
+  appendNoProxyUrlEntries(entries, endpoint);
+  if (otelTransport === "http") {
+    appendNoProxyUrlEntries(entries, logsEndpointFromGrpc(endpoint));
+  }
+  return entries;
 }
 
 function mergeNoProxy(existing, entries) {
@@ -463,9 +503,19 @@ function removeSessionSeenMarkers(installDir) {
 
 // ---------- 合并逻辑 ----------
 
-function buildEnv(template, args, endpoint) {
+function buildEnv(template, args, endpoint, otelTransport) {
   const env = { ...template.env };
-  env.OTEL_EXPORTER_OTLP_ENDPOINT = endpoint;
+  if (otelTransport === "http") {
+    const logsEndpoint = logsEndpointFromGrpc(endpoint);
+    env.OTEL_EXPORTER_OTLP_PROTOCOL = "http/protobuf";
+    env.OTEL_EXPORTER_OTLP_ENDPOINT = httpRootEndpointFromLogs(logsEndpoint);
+    env.OTEL_EXPORTER_OTLP_LOGS_PROTOCOL = "http/protobuf";
+    env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT = logsEndpoint;
+    env.OTEL_EXPORTER_OTLP_METRICS_PROTOCOL = "http/protobuf";
+    env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT = metricsEndpointFromLogs(logsEndpoint);
+  } else {
+    env.OTEL_EXPORTER_OTLP_ENDPOINT = endpoint;
+  }
   // OTEL_RESOURCE_ATTRIBUTES 由 mergeSettings 单独处理（parse-merge 用户已有 + 注入 git.user.*）
   return env;
 }
@@ -476,7 +526,8 @@ function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, noProxyEntr
   // env：plugin 优先（组织规范不允许个人改红线），但保留用户独有的 env
   merged.env = { ...(existing.env || {}) };
   for (const k of OTEL_KEYS) {
-    merged.env[k] = newEnv[k];
+    if (Object.prototype.hasOwnProperty.call(newEnv, k)) merged.env[k] = newEnv[k];
+    else delete merged.env[k];
   }
 
   // OTEL_RESOURCE_ATTRIBUTES：parse-merge 用户已有 attr + 注入 git.user.email/name。
@@ -540,10 +591,11 @@ function logsEndpointFromGrpc(endpoint) {
   }
 }
 
-function buildEndpointConfig(endpoint) {
+function buildEndpointConfig(endpoint, otelTransport) {
   return {
     endpoint,
     logsEndpoint: logsEndpointFromGrpc(endpoint),
+    otelTransport,
     installerVersion: PKG_VERSION,
     packageName: "ai-otel-setup",
   };
@@ -667,7 +719,7 @@ function buildCodexManagedBlock(endpoint, hookDest, launcherDest) {
   ].join("\n");
 }
 
-function installCodex(home, endpoint) {
+function installCodex(home, endpoint, otelTransport) {
   const codexDir = path.join(home, ".codex");
   if (!fs.existsSync(codexDir)) {
     return { tool: "codex", status: "skipped", reason: "未检测到 ~/.codex" };
@@ -680,7 +732,7 @@ function installCodex(home, endpoint) {
   fs.copyFileSync(path.join(__dirname, "templates", "codex", "on-session-start.js"), hookDest);
   fs.chmodSync(hookDest, 0o755);
   const launcherDest = installLauncher(installDir);
-  writeInstallLog(installDir, "codex", endpoint);
+  writeInstallLog(installDir, "codex", endpoint, otelTransport);
   const bak = backup(configPath);
   let existing = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
 
@@ -693,14 +745,14 @@ function installCodex(home, endpoint) {
 
   // hook 同目录的 endpoint.json：hook 脚本运行时读它拿 logs endpoint，避免依赖
   // shell 前缀注入 env（cmd.exe 不认那种语法，跨平台必须改成走文件）。
-  writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint));
+  writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint, otelTransport));
   const managed = buildCodexManagedBlock(endpoint, hookDest, launcherDest);
   const merged = (existing.trimEnd() + "\n\n" + managed + "\n").replace(/\n{3,}/g, "\n\n");
   fs.writeFileSync(configPath, merged, "utf8");
   return { tool: "codex", status: "installed", path: configPath, backup: bak };
 }
 
-function installGemini(home, endpoint) {
+function installGemini(home, endpoint, otelTransport) {
   const geminiDir = path.join(home, ".gemini");
   if (!fs.existsSync(geminiDir)) {
     return { tool: "gemini", status: "skipped", reason: "未检测到 ~/.gemini" };
@@ -712,9 +764,9 @@ function installGemini(home, endpoint) {
   fs.copyFileSync(path.join(__dirname, "templates", "gemini", "on-session-start.js"), hookDest);
   fs.chmodSync(hookDest, 0o755);
   const launcherDest = installLauncher(installDir);
-  writeInstallLog(installDir, "gemini", endpoint);
+  writeInstallLog(installDir, "gemini", endpoint, otelTransport);
   // 同 Codex：endpoint.json 给 hook 脚本读，跨平台不依赖 env 前缀。
-  writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint));
+  writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint, otelTransport));
   const existing = readJSONSafe(settingsPath);
   const bak = backup(settingsPath);
   const merged = { ...existing };
@@ -789,7 +841,8 @@ async function main() {
   }
 
   const endpoint = resolveEndpoint(args.url);
-  const newEnv = buildEnv(settingsTemplate, args, endpoint);
+  const otelTransport = truthyFlag(args.http) ? "http" : "grpc";
+  const newEnv = buildEnv(settingsTemplate, args, endpoint, otelTransport);
 
   const hookEntry = {
     matcher: "*",
@@ -826,13 +879,13 @@ async function main() {
   fs.copyFileSync(hookScriptSrc, hookScriptDest);
   fs.chmodSync(hookScriptDest, 0o755);
   installLauncher(installDir);
-  writeInstallLog(installDir, "claude", endpoint);
+  writeInstallLog(installDir, "claude", endpoint, otelTransport);
 
   // v1.0.3：把 endpoint 写盘，给 hook 脚本的 resolveLogsEndpoint 当兜底。
   // 修的是 v1.0.2 的真实事故：settings.json 的 env 不一定能继承到 hook 子进程
   // （Windows / 已运行的 CC 实例都会踩到），导致 hook fallback 到 localhost
   // 拿 ECONNREFUSED 静默失败、marker 已写但 POST 永不到达。
-  writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint));
+  writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint, otelTransport));
 
   const existing = readJSONSafe(settingsPath);
   const bak = backup(settingsPath);
@@ -841,19 +894,19 @@ async function main() {
     newEnv,
     hookEntry,
     promptHookEntry,
-    buildNoProxyEntries(endpoint),
+    buildNoProxyEntries(endpoint, otelTransport),
     gitUser
   );
   writeJSONAtomic(settingsPath, merged);
 
   const results = [];
   try {
-    results.push(installCodex(home, endpoint));
+    results.push(installCodex(home, endpoint, otelTransport));
   } catch (e) {
     results.push({ tool: "codex", status: "failed", reason: e.message });
   }
   try {
-    results.push(installGemini(home, endpoint));
+    results.push(installGemini(home, endpoint, otelTransport));
   } catch (e) {
     results.push({ tool: "gemini", status: "failed", reason: e.message });
   }
@@ -865,6 +918,7 @@ async function main() {
   console.log("");
   console.log(`  ${"version".padEnd(12)}: ${PKG_VERSION}`);
   console.log(`  ${"endpoint".padEnd(12)}: ${displayEndpoint(endpoint)}`);
+  console.log(`  ${"transport".padEnd(12)}: ${otelTransport === "http" ? "http/protobuf" : "grpc"}`);
   console.log(`  ${"git email".padEnd(12)}: ${gitUser.email}`);
   for (const r of allResults) {
     console.log(`  ${r.tool.padEnd(12)}: ${r.status}${r.reason ? " (" + r.reason + ")" : ""}`);
@@ -899,6 +953,7 @@ function printUsage() {
   url    Collector host（裸 IP 自动补 http://...:4317；裸域名自动补 https://...:24317；也可传完整 URL）
 
 可选：
+  --http | http=1    Claude Code 原生 OTel 改用 OTLP/HTTP，logs 指向 /v1/logs，适合 gRPC 上报异常时排查
   debug=1 | --debug   显示安装路径、备份路径与卸载提示
 `);
 }

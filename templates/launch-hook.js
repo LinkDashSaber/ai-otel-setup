@@ -109,7 +109,9 @@ function runAutoUpdate(installDir) {
     }
 
     logEvent("auto_update_install_start", { currentVersion, latestVersion });
-    runNpmToolSync("npx", ["-y", `${PACKAGE_NAME}@${latestVersion}`, `url=${cfg.endpoint}`], {
+    const installArgs = ["-y", `${PACKAGE_NAME}@${latestVersion}`, `url=${cfg.endpoint}`];
+    if (cfg.otelTransport === "http") installArgs.push("--http");
+    runNpmToolSync("npx", installArgs, {
       stdio: "ignore",
       timeout: 120000,
       windowsHide: true,
@@ -170,12 +172,39 @@ function maybeSpawnAutoUpdate(nodeBin, installDir) {
   }
 }
 
-function telemetryEnvSnapshot() {
+function hookEnvSnapshot() {
   return {
-    telemetryEnabled: process.env.CLAUDE_CODE_ENABLE_TELEMETRY === "1",
-    hasOtlpEndpoint: !!process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
-    otlpProtocol: process.env.OTEL_EXPORTER_OTLP_PROTOCOL || "",
-    logsExporter: process.env.OTEL_LOGS_EXPORTER || "",
+    hookEnvTelemetryEnabled: process.env.CLAUDE_CODE_ENABLE_TELEMETRY === "1",
+    hookEnvHasOtlpEndpoint: !!process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+    hookEnvOtlpProtocol: process.env.OTEL_EXPORTER_OTLP_PROTOCOL || "",
+    hookEnvLogsExporter: process.env.OTEL_LOGS_EXPORTER || "",
+  };
+}
+
+function endpointHost(endpoint) {
+  try {
+    return new URL(endpoint).hostname;
+  } catch (_) {
+    return "";
+  }
+}
+
+function settingsTelemetrySnapshot(installDir) {
+  const settingsPath = path.join(path.dirname(installDir), "settings.json");
+  const settings = readJSONSafe(settingsPath);
+  const env = settings.env || {};
+  const cfg = readJSONSafe(path.join(installDir, "endpoint.json"));
+  const host = endpointHost(cfg.endpoint || "");
+  const noProxy = `${env.NO_PROXY || ""},${env.no_proxy || ""}`;
+  return {
+    settingsTelemetryEnabled: env.CLAUDE_CODE_ENABLE_TELEMETRY === "1",
+    settingsHasOtlpEndpoint: !!env.OTEL_EXPORTER_OTLP_ENDPOINT,
+    settingsOtlpProtocol: env.OTEL_EXPORTER_OTLP_PROTOCOL || "",
+    settingsLogsExporter: env.OTEL_LOGS_EXPORTER || "",
+    settingsMetricsExporter: env.OTEL_METRICS_EXPORTER || "",
+    settingsHasOtlpLogsEndpoint: !!env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,
+    settingsHasOtlpMetricsEndpoint: !!env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
+    settingsNoProxyHasCollector: host ? noProxy.split(",").map((s) => s.trim()).some((s) => s === host || s.startsWith(`${host}:`)) : false,
   };
 }
 
@@ -203,7 +232,11 @@ try {
 maybeSpawnAutoUpdate(nodeBin, __dirname);
 
 const startedAt = Date.now();
-logEvent("hook_launcher_start", { script: path.basename(scriptPath), ...telemetryEnvSnapshot() });
+logEvent("hook_launcher_start", {
+  script: path.basename(scriptPath),
+  ...hookEnvSnapshot(),
+  ...settingsTelemetrySnapshot(__dirname),
+});
 const r = spawnSync(nodeBin, [scriptPath], { stdio: "inherit" });
 logEvent("hook_launcher_exit", {
   script: path.basename(scriptPath),
