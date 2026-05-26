@@ -162,6 +162,7 @@ function safeGit(args) {
       "hostname": os.hostname() || "",
       "data_source": "hook", // Collector 端用 insert 而非 upsert 以保留本标签
     };
+    logEvent("cc_hook_payload", event);
 
     const logsEndpoint = resolveLogsEndpoint();
     const payload = JSON.stringify({
