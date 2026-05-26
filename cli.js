@@ -161,10 +161,10 @@ function truthyFlag(value) {
   return /^(1|true|yes|on)$/i.test(String(value || ""));
 }
 
-function resolveOtelTransport(args, platform) {
+function resolveOtelTransport(args) {
   if (truthyFlag(args.http)) return "http";
   if (truthyFlag(args.grpc)) return "grpc";
-  return platform === "win32" ? "http" : "grpc";
+  return "http";
 }
 
 // ---------- url → endpoint ----------
@@ -850,7 +850,7 @@ async function main() {
   }
 
   const endpoint = resolveEndpoint(args.url);
-  const otelTransport = resolveOtelTransport(args, process.platform);
+  const otelTransport = resolveOtelTransport(args);
   const newEnv = buildEnv(settingsTemplate, args, endpoint, otelTransport);
 
   const hookEntry = {
@@ -962,8 +962,8 @@ function printUsage() {
   url    Collector host（裸 IP 自动补 http://...:4317；裸域名自动补 https://...:24317；也可传完整 URL）
 
 可选：
-  --http | http=1    Claude Code 原生 OTel 改用 OTLP/HTTP（Windows 默认）
-  --grpc | grpc=1    Claude Code 原生 OTel 强制使用 gRPC（macOS / Linux 默认）
+  --http | http=1    Claude Code 原生 OTel 使用 OTLP/HTTP（默认）
+  --grpc | grpc=1    Claude Code 原生 OTel 强制使用 gRPC（fallback）
   debug=1 | --debug   显示安装路径、备份路径与卸载提示
 `);
 }

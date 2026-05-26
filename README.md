@@ -21,8 +21,8 @@ npx -y ai-otel-setup url=你的服务器地址
 | 参数 | 说明 |
 |---|---|
 | `url`（必填） | 服务器地址。可填 IP / 域名，或完整地址。裸 IP 会按本地测试规则生成 `http://IP:4317`；裸域名会按生产规则生成 `https://域名:24317`。不能包含空格或逗号。 |
-| `--http` / `http=1` | Claude Code 原生 OTel 改用 OTLP/HTTP。Windows 默认使用此模式；macOS / Linux 可用该参数手动切换。 |
-| `--grpc` / `grpc=1` | 强制 Claude Code 原生 OTel 使用 gRPC。macOS / Linux 默认使用此模式；仅在需要覆盖 Windows 默认 HTTP 时使用。 |
+| `--http` / `http=1` | Claude Code 原生 OTel 使用 OTLP/HTTP。默认使用此模式，logs 指向 `/v1/logs`，metrics 指向 `/v1/metrics`。 |
+| `--grpc` / `grpc=1` | 强制 Claude Code 原生 OTel 使用 gRPC，作为 HTTP 上报异常时的 fallback。 |
 
 ## 装好后会做什么
 
