@@ -63,6 +63,15 @@ function npmBin(name) {
   return process.platform === "win32" ? `${name}.cmd` : name;
 }
 
+function runNpmToolSync(name, args, options) {
+  const command = npmBin(name);
+  return execFileSync(command, args, {
+    ...options,
+    // Windows cannot reliably exec .cmd shims directly via execFileSync.
+    shell: process.platform === "win32",
+  });
+}
+
 function runAutoUpdate(installDir) {
   const statePath = path.join(installDir, "auto-update-state.json");
   const cfg = readJSONSafe(path.join(installDir, "endpoint.json"));
@@ -80,7 +89,7 @@ function runAutoUpdate(installDir) {
 
   const currentVersion = cfg.installerVersion || cfg.version || "0.0.0";
   try {
-    const latestVersion = execFileSync(npmBin("npm"), ["view", PACKAGE_NAME, "version"], {
+    const latestVersion = runNpmToolSync("npm", ["view", PACKAGE_NAME, "version"], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 8000,
@@ -100,7 +109,7 @@ function runAutoUpdate(installDir) {
     }
 
     logEvent("auto_update_install_start", { currentVersion, latestVersion });
-    execFileSync(npmBin("npx"), ["-y", `${PACKAGE_NAME}@${latestVersion}`, `url=${cfg.endpoint}`], {
+    runNpmToolSync("npx", ["-y", `${PACKAGE_NAME}@${latestVersion}`, `url=${cfg.endpoint}`], {
       stdio: "ignore",
       timeout: 120000,
       windowsHide: true,
@@ -161,6 +170,15 @@ function maybeSpawnAutoUpdate(nodeBin, installDir) {
   }
 }
 
+function telemetryEnvSnapshot() {
+  return {
+    telemetryEnabled: process.env.CLAUDE_CODE_ENABLE_TELEMETRY === "1",
+    hasOtlpEndpoint: !!process.env.OTEL_EXPORTER_OTLP_ENDPOINT,
+    otlpProtocol: process.env.OTEL_EXPORTER_OTLP_PROTOCOL || "",
+    logsExporter: process.env.OTEL_LOGS_EXPORTER || "",
+  };
+}
+
 if (process.argv[2] === "--auto-update") {
   runAutoUpdate(process.argv[3] || __dirname);
   process.exit(0);
@@ -185,7 +203,7 @@ try {
 maybeSpawnAutoUpdate(nodeBin, __dirname);
 
 const startedAt = Date.now();
-logEvent("hook_launcher_start", { script: path.basename(scriptPath) });
+logEvent("hook_launcher_start", { script: path.basename(scriptPath), ...telemetryEnvSnapshot() });
 const r = spawnSync(nodeBin, [scriptPath], { stdio: "inherit" });
 logEvent("hook_launcher_exit", {
   script: path.basename(scriptPath),

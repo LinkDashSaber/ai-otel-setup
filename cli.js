@@ -77,6 +77,19 @@ function installLauncher(installDir) {
   return launcherDest;
 }
 
+function writeInstallLog(installDir, tool, endpoint) {
+  try {
+    const { logEvent } = require(path.join(installDir, "logging.js"));
+    logEvent("installer_complete", {
+      tool,
+      installerVersion: PKG_VERSION,
+      endpoint: displayEndpoint(endpoint),
+    });
+  } catch (_) {
+    // Logging must never break installation.
+  }
+}
+
 const REQUIRED_KEYS = ["url"];
 const HOOK_ID = "team:session-start";
 // UserPromptSubmit 兜底 hook：复用同一脚本，靠 stdin.hook_event_name 分流；
@@ -193,13 +206,27 @@ function displayEndpoint(endpoint) {
   return endpoint;
 }
 
-function mergeNoProxy(existing, host) {
+function buildNoProxyEntries(endpoint) {
+  try {
+    const url = new URL(endpoint);
+    const entries = [url.hostname];
+    if (url.port) entries.push(`${url.hostname}:${url.port}`);
+    return entries;
+  } catch (_) {
+    const host = extractHost(endpoint);
+    return host ? [host] : [];
+  }
+}
+
+function mergeNoProxy(existing, entries) {
   // 合并保留用户已有 NO_PROXY 值，仅追加 collector host，去重保序
   const list = (existing || "")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-  if (host && !list.includes(host)) list.push(host);
+  for (const entry of entries || []) {
+    if (entry && !list.includes(entry)) list.push(entry);
+  }
   return list.join(",");
 }
 
@@ -415,6 +442,25 @@ function backup(p) {
   return bak;
 }
 
+function removeSessionSeenMarkers(installDir) {
+  try {
+    if (!fs.existsSync(installDir)) return 0;
+    let count = 0;
+    for (const name of fs.readdirSync(installDir)) {
+      if (!name.startsWith(".session-seen.")) continue;
+      try {
+        fs.unlinkSync(path.join(installDir, name));
+        count++;
+      } catch (_) {
+        // Best effort cleanup.
+      }
+    }
+    return count;
+  } catch (_) {
+    return 0;
+  }
+}
+
 // ---------- 合并逻辑 ----------
 
 function buildEnv(template, args, endpoint) {
@@ -424,7 +470,7 @@ function buildEnv(template, args, endpoint) {
   return env;
 }
 
-function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, collectorHost, gitUser) {
+function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, noProxyEntries, gitUser) {
   const merged = { ...existing };
 
   // env：plugin 优先（组织规范不允许个人改红线），但保留用户独有的 env
@@ -441,11 +487,11 @@ function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, collectorHo
     if (ra) merged.env.OTEL_RESOURCE_ATTRIBUTES = ra;
   }
 
-  // 兜底用户写坏的 HTTP(S)_PROXY：把 collector host 加进 NO_PROXY，让 OTel gRPC 绕过代理
+  // 兜底用户写坏的 HTTP(S)_PROXY：把 collector host 与 host:port 加进 NO_PROXY，让 OTel gRPC 绕过代理
   // 仅追加，不动用户原有的 NO_PROXY 值，也不动 HTTP_PROXY / HTTPS_PROXY
-  if (collectorHost) {
-    merged.env.NO_PROXY = mergeNoProxy(merged.env.NO_PROXY, collectorHost);
-    merged.env.no_proxy = mergeNoProxy(merged.env.no_proxy, collectorHost);
+  if (noProxyEntries && noProxyEntries.length) {
+    merged.env.NO_PROXY = mergeNoProxy(merged.env.NO_PROXY, noProxyEntries);
+    merged.env.no_proxy = mergeNoProxy(merged.env.no_proxy, noProxyEntries);
   }
 
   merged.hooks = { ...(existing.hooks || {}) };
@@ -630,9 +676,11 @@ function installCodex(home, endpoint) {
   const configPath = path.join(codexDir, "config.toml");
   const hookDest = path.join(installDir, "on-session-start.js");
   fs.mkdirSync(installDir, { recursive: true });
+  removeSessionSeenMarkers(installDir);
   fs.copyFileSync(path.join(__dirname, "templates", "codex", "on-session-start.js"), hookDest);
   fs.chmodSync(hookDest, 0o755);
   const launcherDest = installLauncher(installDir);
+  writeInstallLog(installDir, "codex", endpoint);
   const bak = backup(configPath);
   let existing = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
 
@@ -664,6 +712,7 @@ function installGemini(home, endpoint) {
   fs.copyFileSync(path.join(__dirname, "templates", "gemini", "on-session-start.js"), hookDest);
   fs.chmodSync(hookDest, 0o755);
   const launcherDest = installLauncher(installDir);
+  writeInstallLog(installDir, "gemini", endpoint);
   // 同 Codex：endpoint.json 给 hook 脚本读，跨平台不依赖 env 前缀。
   writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint));
   const existing = readJSONSafe(settingsPath);
@@ -777,6 +826,7 @@ async function main() {
   fs.copyFileSync(hookScriptSrc, hookScriptDest);
   fs.chmodSync(hookScriptDest, 0o755);
   installLauncher(installDir);
+  writeInstallLog(installDir, "claude", endpoint);
 
   // v1.0.3：把 endpoint 写盘，给 hook 脚本的 resolveLogsEndpoint 当兜底。
   // 修的是 v1.0.2 的真实事故：settings.json 的 env 不一定能继承到 hook 子进程
@@ -791,7 +841,7 @@ async function main() {
     newEnv,
     hookEntry,
     promptHookEntry,
-    extractHost(endpoint),
+    buildNoProxyEntries(endpoint),
     gitUser
   );
   writeJSONAtomic(settingsPath, merged);
