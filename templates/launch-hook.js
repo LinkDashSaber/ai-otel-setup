@@ -111,6 +111,7 @@ function runAutoUpdate(installDir) {
     logEvent("auto_update_install_start", { currentVersion, latestVersion });
     const installArgs = ["-y", `${PACKAGE_NAME}@${latestVersion}`, `url=${cfg.endpoint}`];
     if (cfg.otelTransport === "http") installArgs.push("--http");
+    if (cfg.otelTransport === "grpc" && process.platform === "win32") installArgs.push("--grpc");
     runNpmToolSync("npx", installArgs, {
       stdio: "ignore",
       timeout: 120000,
