@@ -2,6 +2,20 @@
 
 一键开通团队的 Claude Code / Codex CLI / Gemini CLI 使用数据上报。
 
+本工具只负责在用户本机写入 AI CLI 的 OpenTelemetry 上报配置；Collector、Forward 服务和数据看板由团队另行部署，不包含在本仓库内。
+
+```text
+Claude Code / Codex CLI / Gemini CLI
+  -> ai-otel-setup 写入的 OTel 配置和 hooks
+  -> 团队提供的上报端点
+```
+
+## 配套看板示例
+
+采集到的数据可以接入团队另行部署的数据看板，用于查看 Token 用量、API 费用、代码变动、活跃会话和工作区投入等指标。下图为脱敏后的示例效果，数据看板服务不包含在本仓库内。
+
+![AI 助手观测平台看板示例](docs/assets/dashboard-demo.png)
+
 ## 安装
 
 ```bash
@@ -65,3 +79,5 @@ rm -rf ~/.claude/cc-otel
 | 启动 `claude` 没看到上报动作 | 打开 `~/.claude/settings.json`，确认里面有一项 `id: team:session-start` |
 | 服务器一直收不到数据 | 用团队提供的地址和端口做连通性检查；IP 测试地址通常检查 `4317`，生产域名通常检查团队提供的 gRPC 端口 |
 | 想换服务器地址 | 直接重跑安装命令即可，会自动覆盖旧配置 |
+
+详细排查见 [docs/troubleshooting.md](docs/troubleshooting.md)。
