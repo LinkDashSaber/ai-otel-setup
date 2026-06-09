@@ -1050,9 +1050,10 @@ async function main() {
   const rawBodiesDir = path.join(installDir, "raw-bodies");
   const rawUploadToken = args["upload-token"] || args.uploadtoken || "";
   const mongoGrayTag = normalizeOptionalTag(args["mongo-gray"] || args.mongogray);
+  const explicitRawUploadUrl = normalizeOptionalUrl(args["upload-url"] || args.uploadurl);
   const rawUploadUrl =
-    normalizeOptionalUrl(args["upload-url"] || args.uploadurl) ||
-    rawUploadUrlFromEndpoint(endpoint);
+    explicitRawUploadUrl ||
+    (mongoGrayTag || rawUploadToken ? rawUploadUrlFromEndpoint(endpoint) : "");
   fs.mkdirSync(rawBodiesDir, { recursive: true, mode: 0o700 });
   try {
     fs.chmodSync(rawBodiesDir, 0o700);
@@ -1191,7 +1192,7 @@ function printUsage() {
   --http | http=1    Claude Code 原生 OTel 使用 OTLP/HTTP（默认）
   --grpc | grpc=1    Claude Code 原生 OTel 强制使用 gRPC（fallback）
   mongo-gray=TAG     给 OTEL_RESOURCE_ATTRIBUTES 注入 ai_otel.mongo_gray=TAG，用于服务端全量旁路灰度
-  upload-url=URL     raw body 上传入口，例如 https://host/v1/raw-bodies；不传时会按 url 自动推导 raw-upload 域名
+  upload-url=URL     raw body 上传入口，例如 https://host/v1/raw-bodies；灰度安装时不传会按 url 自动推导 raw-upload 域名
   upload-token=TOKEN raw body 上传 Bearer token（可选；传入时写入本地 0600 token 文件）
   debug=1 | --debug   显示安装路径、备份路径与卸载提示
 `);
