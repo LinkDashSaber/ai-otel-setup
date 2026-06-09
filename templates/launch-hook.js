@@ -24,6 +24,7 @@ try {
 const PACKAGE_NAME = "ai-otel-setup";
 const UPDATE_CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000;
 const UPDATE_RETRY_INTERVAL_MS = 10 * 60 * 1000;
+const RAW_UPLOAD_TRIGGER_INTERVAL_MS = 2 * 60 * 1000;
 
 function readJSONSafe(file) {
   try {
@@ -173,6 +174,41 @@ function maybeSpawnAutoUpdate(nodeBin, installDir) {
   }
 }
 
+function maybeSpawnRawUploader(nodeBin, installDir) {
+  const uploaderPath = path.join(installDir, "raw-body-uploader.js");
+  if (!fs.existsSync(uploaderPath)) return;
+
+  const cfg = readJSONSafe(path.join(installDir, "endpoint.json"));
+  if (!cfg.rawUploadUrl) return;
+
+  const statePath = path.join(installDir, "raw-uploader-trigger-state.json");
+  const state = readJSONSafe(statePath);
+  const now = Date.now();
+  const lastAttemptAt = Number(state.lastAttemptAt || 0);
+  if (lastAttemptAt && now - lastAttemptAt < RAW_UPLOAD_TRIGGER_INTERVAL_MS) return;
+  if (!writeJSONSafe(statePath, { ...state, lastAttemptAt: now, lastResult: "scheduled" })) return;
+
+  try {
+    const child = spawn(nodeBin, [uploaderPath, "--once", "--max-runtime=25"], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    child.unref();
+    logEvent("raw_uploader_scheduled", { reason: "hook_trigger" });
+  } catch (e) {
+    writeJSONSafe(statePath, {
+      ...state,
+      lastAttemptAt: now,
+      lastResult: "spawn-failed",
+      lastError: e && e.message ? String(e.message).slice(0, 300) : "unknown",
+    });
+    logEvent("raw_uploader_spawn_failed", {
+      error: e && e.message ? e.message : "unknown",
+    });
+  }
+}
+
 function hookEnvSnapshot() {
   return {
     hookEnvTelemetryEnabled: process.env.CLAUDE_CODE_ENABLE_TELEMETRY === "1",
@@ -231,6 +267,7 @@ try {
 }
 
 maybeSpawnAutoUpdate(nodeBin, __dirname);
+maybeSpawnRawUploader(nodeBin, __dirname);
 
 const startedAt = Date.now();
 logEvent("hook_launcher_start", {

@@ -3,8 +3,8 @@
  * SessionStart / UserPromptSubmit 兜底 hook
  *
  * 职责：
- *   采集 CC 原生 OTel 不覆盖的 5 个字段（cwd / git_remote / git_user_email /
- *   git_user_name / hostname），通过 OTLP/HTTP 4318 发给 Collector，
+ *   采集 CC 原生 OTel 不覆盖的字段（cwd / git_remote / git_user_email /
+ *   git_user_name / hostname / ANTHROPIC_BASE_URL route snapshot），通过 OTLP/HTTP 4318 发给 Collector，
  *   与 OTel 主流合流。
  *
  * 双 hook 复用同一脚本：
@@ -109,6 +109,30 @@ function safeGit(args) {
   }
 }
 
+function normalizedOrigin(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  try {
+    const url = new URL(value);
+    return `${url.protocol}//${url.host}`;
+  } catch (_) {
+    // Fall back to a conservative, query-free origin-like value so
+    // path/query/userinfo are not reported.
+    return value
+      .replace(/^[^:]+:\/\//, (m) => m.toLowerCase())
+      .replace(/[?#].*$/, "")
+      .replace(/\/+$/, "")
+      .slice(0, 200);
+  }
+}
+
+function anthropicRouteSnapshot() {
+  const anthropicBaseUrl = normalizedOrigin(process.env.ANTHROPIC_BASE_URL);
+  return {
+    "anthropic_base_url": anthropicBaseUrl,
+  };
+}
+
 // -------- 主流程 ----------
 
 (async () => {
@@ -160,6 +184,7 @@ function safeGit(args) {
       "git.user.email": safeGit(["-C", cwd, "config", "user.email"]) || "",
       "git.user.name": safeGit(["-C", cwd, "config", "user.name"]) || "",
       "hostname": os.hostname() || "",
+      ...anthropicRouteSnapshot(),
       "data_source": "hook", // Collector 端用 insert 而非 upsert 以保留本标签
     };
     logEvent("cc_hook_payload", event);

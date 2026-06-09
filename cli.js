@@ -22,7 +22,8 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const net = require("net");
-const { execFileSync } = require("child_process");
+const crypto = require("crypto");
+const { execFileSync, spawnSync } = require("child_process");
 
 const PKG_VERSION = require("./package.json").version;
 
@@ -164,10 +165,52 @@ function resolveOtelTransport(args) {
   return "http";
 }
 
+function normalizeOptionalUrl(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  return value.replace(/\/+$/, "");
+}
+
+function normalizeOptionalTag(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  return value;
+}
+
+function deriveRawUploadHost(hostname) {
+  const host = String(hostname || "").replace(/^\[|\]$/g, "");
+  if (!host || isIpHost(host) || isLocalHost(host)) return host;
+  const parts = host.split(".");
+  if (!parts.length) return host;
+  if (!parts[0].endsWith("-raw-upload")) parts[0] = `${parts[0]}-raw-upload`;
+  return parts.join(".");
+}
+
+function rawUploadUrlFromEndpoint(endpoint) {
+  try {
+    const logsUrl = new URL(logsEndpointFromGrpc(endpoint));
+    logsUrl.hostname = deriveRawUploadHost(logsUrl.hostname);
+    if (!isIpHost(logsUrl.hostname) && !isLocalHost(logsUrl.hostname)) {
+      logsUrl.port = "";
+    }
+    logsUrl.pathname = "/v1/raw-bodies";
+    logsUrl.search = "";
+    logsUrl.hash = "";
+    return logsUrl.toString().replace(/\/+$/, "");
+  } catch (_) {
+    return "";
+  }
+}
+
 // ---------- url → endpoint ----------
 
 function isIpHost(host) {
   return net.isIP(String(host || "").replace(/^\[|\]$/g, "")) !== 0;
+}
+
+function isLocalHost(host) {
+  const value = String(host || "").replace(/^\[|\]$/g, "").toLowerCase();
+  return value === "localhost" || value === "127.0.0.1" || value === "::1";
 }
 
 function bracketIpv6Host(host) {
@@ -197,9 +240,9 @@ function resolveEndpoint(rawUrl) {
   //   - 域名：生产公网形态，OTLP/gRPC = https://DOMAIN:24317
   // 判断只看地址形态，不写入任何具体 host。
   const url = new URL(`http://${input}`);
-  const isIp = isIpHost(url.hostname);
-  const port = url.port || (isIp ? "4317" : "24317");
-  return formatRootUrl(isIp ? "http:" : "https:", url.hostname, port);
+  const localOrIp = isIpHost(url.hostname) || isLocalHost(url.hostname);
+  const port = url.port || (localOrIp ? "4317" : "24317");
+  return formatRootUrl(localOrIp ? "http:" : "https:", url.hostname, port);
 }
 
 function httpRootEndpointFromLogs(logsEndpoint) {
@@ -517,7 +560,7 @@ function removeSessionSeenMarkers(installDir) {
 
 // ---------- 合并逻辑 ----------
 
-function buildEnv(template, args, endpoint, otelTransport) {
+function buildEnv(template, args, endpoint, otelTransport, rawBodiesDir) {
   const env = { ...template.env };
   if (otelTransport === "http") {
     const logsEndpoint = logsEndpointFromGrpc(endpoint);
@@ -530,11 +573,14 @@ function buildEnv(template, args, endpoint, otelTransport) {
   } else {
     env.OTEL_EXPORTER_OTLP_ENDPOINT = endpoint;
   }
+  if (env.OTEL_LOG_RAW_API_BODIES === "file:PLACEHOLDER_RAW_BODIES_DIR") {
+    env.OTEL_LOG_RAW_API_BODIES = `file:${rawBodiesDir}`;
+  }
   // OTEL_RESOURCE_ATTRIBUTES 由 mergeSettings 单独处理（parse-merge 用户已有 + 注入 git.user.*）
   return env;
 }
 
-function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, noProxyEntries, gitUser) {
+function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, noProxyEntries, gitUser, machineId, mongoGrayTag) {
   const merged = { ...existing };
 
   // env：plugin 优先（组织规范不允许个人改红线），但保留用户独有的 env
@@ -551,6 +597,12 @@ function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, noProxyEntr
     const ra = mergeResourceAttrs(merged.env.OTEL_RESOURCE_ATTRIBUTES, gitUser);
     if (ra) merged.env.OTEL_RESOURCE_ATTRIBUTES = ra;
   }
+  if (machineId) {
+    const attrs = parseResourceAttrs(merged.env.OTEL_RESOURCE_ATTRIBUTES || "");
+    attrs["ai_otel.machine_id"] = machineId;
+    if (mongoGrayTag) attrs["ai_otel.mongo_gray"] = mongoGrayTag;
+    merged.env.OTEL_RESOURCE_ATTRIBUTES = serializeResourceAttrs(attrs);
+  }
 
   // 兜底用户写坏的 HTTP(S)_PROXY：把 collector host 与 host:port 加进 NO_PROXY，让 OTel gRPC 绕过代理
   // 仅追加，不动用户原有的 NO_PROXY 值，也不动 HTTP_PROXY / HTTPS_PROXY
@@ -561,24 +613,32 @@ function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, noProxyEntr
 
   merged.hooks = { ...(existing.hooks || {}) };
 
+  const isManagedClaudeHook = (h, expectedId) => {
+    if (!h) return false;
+    if (h.id === expectedId) return true;
+    const hooks = Array.isArray(h.hooks) ? h.hooks : [];
+    return hooks.some((item) => {
+      const command = String(item && item.command ? item.command : "");
+      return command.includes("cc-otel") && command.includes("launch-hook.js") && command.includes("on-session-start.js");
+    });
+  };
+
   // hooks.SessionStart：按 id 去重，存在则覆盖，不存在则追加
   const sessionStart = Array.isArray(merged.hooks.SessionStart)
     ? [...merged.hooks.SessionStart]
     : [];
-  const idx = sessionStart.findIndex((h) => h && h.id === HOOK_ID);
-  if (idx >= 0) sessionStart[idx] = hookEntry;
-  else sessionStart.push(hookEntry);
-  merged.hooks.SessionStart = sessionStart;
+  const keptSessionStart = sessionStart.filter((h) => !isManagedClaudeHook(h, HOOK_ID));
+  keptSessionStart.push(hookEntry);
+  merged.hooks.SessionStart = keptSessionStart;
 
   // hooks.UserPromptSubmit：兜底 hook，按 PROMPT_HOOK_ID 去重，规则同上
   if (promptHookEntry) {
     const userPromptSubmit = Array.isArray(merged.hooks.UserPromptSubmit)
       ? [...merged.hooks.UserPromptSubmit]
       : [];
-    const pidx = userPromptSubmit.findIndex((h) => h && h.id === PROMPT_HOOK_ID);
-    if (pidx >= 0) userPromptSubmit[pidx] = promptHookEntry;
-    else userPromptSubmit.push(promptHookEntry);
-    merged.hooks.UserPromptSubmit = userPromptSubmit;
+    const keptUserPromptSubmit = userPromptSubmit.filter((h) => !isManagedClaudeHook(h, PROMPT_HOOK_ID));
+    keptUserPromptSubmit.push(promptHookEntry);
+    merged.hooks.UserPromptSubmit = keptUserPromptSubmit;
   }
 
   return merged;
@@ -587,10 +647,10 @@ function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, noProxyEntr
 function logsEndpointFromGrpc(endpoint) {
   try {
     const grpcUrl = new URL(endpoint);
-    const isIp = isIpHost(grpcUrl.hostname);
-    const logsUrl = new URL(`${isIp ? "http:" : "https:"}//${bracketIpv6Host(grpcUrl.hostname)}`);
+    const localOrIp = isIpHost(grpcUrl.hostname) || isLocalHost(grpcUrl.hostname);
+    const logsUrl = new URL(`${localOrIp ? "http:" : "https:"}//${bracketIpv6Host(grpcUrl.hostname)}`);
 
-    if (isIp) {
+    if (localOrIp) {
       logsUrl.port = !grpcUrl.port || grpcUrl.port === "4317" ? "4318" : grpcUrl.port;
     } else if (grpcUrl.port && grpcUrl.port !== "24317") {
       logsUrl.port = grpcUrl.port;
@@ -613,6 +673,113 @@ function buildEndpointConfig(endpoint, otelTransport) {
     installerVersion: PKG_VERSION,
     packageName: "ai-otel-setup",
   };
+}
+
+function getOrCreateMachineId(installDir) {
+  const p = path.join(installDir, "machine-id");
+  try {
+    if (fs.existsSync(p)) {
+      const existing = fs.readFileSync(p, "utf8").trim();
+      if (existing) return existing;
+    }
+  } catch (_) {
+    // Regenerate below.
+  }
+  const id = crypto.randomUUID();
+  fs.mkdirSync(installDir, { recursive: true });
+  fs.writeFileSync(p, id + "\n", { mode: 0o600 });
+  return id;
+}
+
+function buildFullEndpointConfig(endpoint, otelTransport, extra = {}) {
+  return {
+    ...buildEndpointConfig(endpoint, otelTransport),
+    ...extra,
+  };
+}
+
+function installRawUploader(installDir, uploadToken) {
+  const uploaderDir = path.join(installDir, "raw-uploader");
+  fs.mkdirSync(uploaderDir, { recursive: true });
+  const uploaderDest = path.join(installDir, "raw-body-uploader.js");
+  fs.copyFileSync(path.join(__dirname, "templates", "raw-body-uploader.js"), uploaderDest);
+  fs.chmodSync(uploaderDest, 0o755);
+  const tokenPath = path.join(installDir, "raw-upload-token");
+  if (uploadToken) {
+    fs.writeFileSync(tokenPath, String(uploadToken).trim() + "\n", { mode: 0o600 });
+  } else if (fs.existsSync(tokenPath)) {
+    fs.unlinkSync(tokenPath);
+  }
+}
+
+function launchctlPath() {
+  try {
+    return execFileSync("/usr/bin/which", ["launchctl"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1000,
+    }).trim();
+  } catch (_) {
+    return "";
+  }
+}
+
+function installMacRawUploaderTimer(installDir) {
+  if (process.platform !== "darwin") return { status: "skipped" };
+  const launchctl = launchctlPath();
+  if (!launchctl) return { status: "skipped", reason: "launchctl not found" };
+  const agentsDir = path.join(os.homedir(), "Library", "LaunchAgents");
+  fs.mkdirSync(agentsDir, { recursive: true });
+  const plistPath = path.join(agentsDir, "com.ai-otel.raw-uploader.plist");
+  const uploaderPath = path.join(installDir, "raw-body-uploader.js");
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ai-otel.raw-uploader</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${escapeXml(NODE_BIN)}</string>
+    <string>${escapeXml(uploaderPath)}</string>
+    <string>--once</string>
+    <string>--max-runtime=25</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${escapeXml(path.join(installDir, "raw-uploader.out.log"))}</string>
+  <key>StandardErrorPath</key>
+  <string>${escapeXml(path.join(installDir, "raw-uploader.err.log"))}</string>
+</dict>
+</plist>
+`;
+  fs.writeFileSync(plistPath, plist, "utf8");
+  try {
+    spawnSync(launchctl, ["unload", plistPath], {
+      stdio: "ignore",
+      timeout: 3000,
+    });
+  } catch (_) {}
+  const r = spawnSync(launchctl, ["load", plistPath], {
+    stdio: "ignore",
+    timeout: 3000,
+  });
+  return {
+    status: r.status === 0 ? "installed" : "written",
+    path: plistPath,
+  };
+}
+
+function escapeXml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 // ---------- Codex config.toml 处理 ----------
@@ -879,7 +1046,20 @@ async function main() {
 
   const endpoint = resolveEndpoint(args.url);
   const otelTransport = resolveOtelTransport(args);
-  const newEnv = buildEnv(settingsTemplate, args, endpoint, otelTransport);
+  const machineId = getOrCreateMachineId(installDir);
+  const rawBodiesDir = path.join(installDir, "raw-bodies");
+  const rawUploadToken = args["upload-token"] || args.uploadtoken || "";
+  const mongoGrayTag = normalizeOptionalTag(args["mongo-gray"] || args.mongogray);
+  const rawUploadUrl =
+    normalizeOptionalUrl(args["upload-url"] || args.uploadurl) ||
+    rawUploadUrlFromEndpoint(endpoint);
+  fs.mkdirSync(rawBodiesDir, { recursive: true, mode: 0o700 });
+  try {
+    fs.chmodSync(rawBodiesDir, 0o700);
+  } catch (_) {
+    // Best effort on Windows / restrictive filesystems.
+  }
+  const newEnv = buildEnv(settingsTemplate, args, endpoint, otelTransport, rawBodiesDir);
 
   const hookEntry = {
     matcher: "*",
@@ -916,13 +1096,25 @@ async function main() {
   fs.copyFileSync(hookScriptSrc, hookScriptDest);
   fs.chmodSync(hookScriptDest, 0o755);
   installLauncher(installDir);
+  installRawUploader(installDir, rawUploadToken);
+  const rawUploaderTimer = rawUploadUrl ? installMacRawUploaderTimer(installDir) : { status: "skipped" };
   writeInstallLog(installDir, "claude", endpoint, otelTransport);
 
   // v1.0.3：把 endpoint 写盘，给 hook 脚本的 resolveLogsEndpoint 当兜底。
   // 修的是 v1.0.2 的真实事故：settings.json 的 env 不一定能继承到 hook 子进程
   // （Windows / 已运行的 CC 实例都会踩到），导致 hook fallback 到 localhost
   // 拿 ECONNREFUSED 静默失败、marker 已写但 POST 永不到达。
-  writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint, otelTransport));
+  writeJSONAtomic(
+    path.join(installDir, "endpoint.json"),
+    buildFullEndpointConfig(endpoint, otelTransport, {
+      machineId,
+      rawBodiesDir,
+      rawUploadUrl,
+      rawUploadChunkBytes: 4 * 1024 * 1024,
+      hasUploadToken: !!rawUploadToken,
+      gitUserEmail: gitUser.email,
+    })
+  );
 
   const existing = readJSONSafe(settingsPath);
   const bak = backup(settingsPath);
@@ -932,7 +1124,9 @@ async function main() {
     hookEntry,
     promptHookEntry,
     buildNoProxyEntries(endpoint, otelTransport),
-    gitUser
+    gitUser,
+    machineId,
+    mongoGrayTag
   );
   writeJSONAtomic(settingsPath, merged);
 
@@ -957,6 +1151,10 @@ async function main() {
   console.log(`  ${"endpoint".padEnd(12)}: ${displayEndpoint(endpoint)}`);
   console.log(`  ${"transport".padEnd(12)}: ${otelTransport === "http" ? "http/protobuf" : "grpc"}`);
   console.log(`  ${"git email".padEnd(12)}: ${gitUser.email}`);
+  console.log(`  ${"raw bodies".padEnd(12)}: ${rawBodiesDir}`);
+  console.log(`  ${"raw upload".padEnd(12)}: ${rawUploadUrl ? "enabled" : "disabled"}`);
+  if (rawUploadUrl) console.log(`  ${"raw timer".padEnd(12)}: ${rawUploaderTimer.status}`);
+  if (mongoGrayTag) console.log(`  ${"mongo gray".padEnd(12)}: ${mongoGrayTag}`);
   for (const r of allResults) {
     console.log(`  ${r.tool.padEnd(12)}: ${r.status}${r.reason ? " (" + r.reason + ")" : ""}`);
   }
@@ -992,6 +1190,9 @@ function printUsage() {
 可选：
   --http | http=1    Claude Code 原生 OTel 使用 OTLP/HTTP（默认）
   --grpc | grpc=1    Claude Code 原生 OTel 强制使用 gRPC（fallback）
+  mongo-gray=TAG     给 OTEL_RESOURCE_ATTRIBUTES 注入 ai_otel.mongo_gray=TAG，用于服务端全量旁路灰度
+  upload-url=URL     raw body 上传入口，例如 https://host/v1/raw-bodies；不传时会按 url 自动推导 raw-upload 域名
+  upload-token=TOKEN raw body 上传 Bearer token（可选；传入时写入本地 0600 token 文件）
   debug=1 | --debug   显示安装路径、备份路径与卸载提示
 `);
 }
