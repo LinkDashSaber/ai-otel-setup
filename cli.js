@@ -182,7 +182,11 @@ function deriveRawUploadHost(hostname) {
   if (!host || isIpHost(host) || isLocalHost(host)) return host;
   const parts = host.split(".");
   if (!parts.length) return host;
-  if (!parts[0].endsWith("-raw-upload")) parts[0] = `${parts[0]}-raw-upload`;
+  if (parts[0].endsWith("-raw-upload")) {
+    parts[0] = parts[0].replace(/-raw-upload$/, "-upload");
+  } else if (!parts[0].endsWith("-upload")) {
+    parts[0] = `${parts[0]}-upload`;
+  }
   return parts.join(".");
 }
 
@@ -1349,7 +1353,7 @@ function printUsage() {
   --grpc | grpc=1    Claude Code 原生 OTel 强制使用 gRPC（fallback）
   mongo-gray=TAG     给 OTEL_RESOURCE_ATTRIBUTES 注入 ai_otel.mongo_gray=TAG，用于服务端全量旁路灰度
   upload-url=URL     raw body 上传入口，例如 https://host/v1/raw-bodies；灰度安装时不传会按 url 自动推导 raw-upload 域名
-  upload-token=TOKEN raw body 上传 Bearer token（可选；传入时写入本地 0600 token 文件）
+  upload-token=TOKEN raw body 上传 Bearer token（可选；仅服务端开启鉴权时需要，传入时写入本地 0600 token 文件）
   debug=1 | --debug   显示安装路径、备份路径与卸载提示
 `);
 }

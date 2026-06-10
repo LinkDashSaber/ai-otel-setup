@@ -30,6 +30,7 @@ const DEFAULT_STABLE_AGE_MS = 15 * 1000;
 const DEFAULT_SENT_RETENTION_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_RAW_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const DEFAULT_SOFT_LIMIT_BYTES = 5 * 1024 * 1024 * 1024;
+const LOCK_STALE_MS = 30 * 60 * 1000;
 
 function readJSONSafe(file) {
   try {
@@ -150,11 +151,80 @@ function rawUploadBase(url) {
   return String(url || "").replace(/\/+$/, "");
 }
 
+function readLockInfo() {
+  try {
+    return JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
+  } catch (_) {
+    return null;
+  }
+}
+
+function processAlive(pid) {
+  const id = Number(pid);
+  if (!Number.isInteger(id) || id <= 0) return false;
+  try {
+    process.kill(id, 0);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function removeLockFile() {
+  try {
+    fs.unlinkSync(LOCK_FILE);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function maybeRecoverStaleLock() {
+  const info = readLockInfo();
+  const now = Date.now();
+  const startedAtMs = Date.parse(info && info.startedAt ? info.startedAt : "");
+  const ageMs = Number.isFinite(startedAtMs) ? now - startedAtMs : null;
+  const alive = info && info.pid ? processAlive(info.pid) : false;
+
+  if (info && info.pid && !alive) {
+    if (removeLockFile()) {
+      logEvent("raw_uploader_lock_recovered", {
+        reason: "pid_not_alive",
+        stalePid: info.pid,
+        ageMs: ageMs === null ? "" : ageMs,
+      });
+      return true;
+    }
+  }
+
+  if (ageMs !== null && ageMs > LOCK_STALE_MS) {
+    if (removeLockFile()) {
+      logEvent("raw_uploader_lock_recovered", {
+        reason: alive ? "lock_too_old_process_alive" : "lock_too_old",
+        stalePid: info && info.pid ? info.pid : "",
+        ageMs,
+      });
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function acquireLock() {
   fs.mkdirSync(UPLOADER_DIR, { recursive: true });
-  const fd = fs.openSync(LOCK_FILE, "wx", 0o600);
-  fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
-  return fd;
+  try {
+    const fd = fs.openSync(LOCK_FILE, "wx", 0o600);
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+    return fd;
+  } catch (e) {
+    if (e && e.code === "EEXIST" && maybeRecoverStaleLock()) {
+      const fd = fs.openSync(LOCK_FILE, "wx", 0o600);
+      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+      return fd;
+    }
+    throw e;
+  }
 }
 
 function releaseLock(fd) {
