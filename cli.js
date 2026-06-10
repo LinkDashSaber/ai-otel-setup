@@ -773,6 +773,159 @@ function installMacRawUploaderTimer(installDir) {
   };
 }
 
+function systemdQuoteArg(arg) {
+  return `"${String(arg).replace(/(["\\$`])/g, "\\$1")}"`;
+}
+
+function installLinuxRawUploaderTimer(installDir) {
+  if (process.platform !== "linux") return { status: "skipped" };
+  const systemctl = (() => {
+    try {
+      return execFileSync("/usr/bin/which", ["systemctl"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1000,
+      }).trim();
+    } catch (_) {
+      return "";
+    }
+  })();
+
+  const uploaderPath = path.join(installDir, "raw-body-uploader.js");
+  const unitName = "ai-otel-raw-uploader";
+  const userSystemdDir = path.join(os.homedir(), ".config", "systemd", "user");
+  const servicePath = path.join(userSystemdDir, `${unitName}.service`);
+  const timerPath = path.join(userSystemdDir, `${unitName}.timer`);
+
+  if (systemctl) {
+    fs.mkdirSync(userSystemdDir, { recursive: true });
+    const service = `[Unit]
+Description=AI OTEL raw body uploader
+
+[Service]
+Type=oneshot
+ExecStart=${systemdQuoteArg(NODE_BIN)} ${systemdQuoteArg(uploaderPath)} --once --max-runtime=25
+`;
+    const timer = `[Unit]
+Description=Run AI OTEL raw body uploader every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+Unit=${unitName}.service
+
+[Install]
+WantedBy=timers.target
+`;
+    fs.writeFileSync(servicePath, service, "utf8");
+    fs.writeFileSync(timerPath, timer, "utf8");
+
+    try {
+      spawnSync(systemctl, ["--user", "daemon-reload"], { stdio: "ignore", timeout: 5000 });
+      spawnSync(systemctl, ["--user", "enable", "--now", `${unitName}.timer`], {
+        stdio: "ignore",
+        timeout: 8000,
+      });
+      return { status: "installed", path: timerPath };
+    } catch (_) {
+      // Fall through to crontab fallback below.
+    }
+  }
+
+  const crontab = (() => {
+    try {
+      return execFileSync("/usr/bin/which", ["crontab"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1000,
+      }).trim();
+    } catch (_) {
+      return "";
+    }
+  })();
+  if (!crontab) return { status: "written", reason: "systemctl/crontab not found" };
+
+  const cronMarker = "# ai-otel-raw-uploader";
+  const cronLine = `* * * * * ${systemdQuoteArg(NODE_BIN)} ${systemdQuoteArg(uploaderPath)} --once --max-runtime=25 >/dev/null 2>&1 ${cronMarker}`;
+  let existing = "";
+  try {
+    existing = execFileSync(crontab, ["-l"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 3000,
+    });
+  } catch (_) {
+    existing = "";
+  }
+  const lines = existing
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line && !line.includes(cronMarker));
+  lines.push(cronLine);
+  const payload = lines.join("\n") + "\n";
+  const r = spawnSync(crontab, ["-"], {
+    input: payload,
+    encoding: "utf8",
+    stdio: ["pipe", "ignore", "ignore"],
+    timeout: 5000,
+  });
+  return {
+    status: r.status === 0 ? "installed" : "written",
+    path: "crontab",
+  };
+}
+
+function installWindowsRawUploaderTimer(installDir) {
+  if (process.platform !== "win32") return { status: "skipped" };
+  const schtasks = (() => {
+    try {
+      return execFileSync("where", ["schtasks"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        shell: true,
+        timeout: 1000,
+      })
+        .split(/\r?\n/)[0]
+        .trim();
+    } catch (_) {
+      return "schtasks";
+    }
+  })();
+  const taskName = "ai-otel-raw-uploader";
+  const uploaderPath = path.join(installDir, "raw-body-uploader.js").replace(/\\/g, "/");
+  const nodePath = NODE_BIN.replace(/\\/g, "/");
+  const taskCommand = `"${nodePath}" "${uploaderPath}" --once --max-runtime=25`;
+
+  try {
+    spawnSync(schtasks, ["/Delete", "/F", "/TN", taskName], {
+      stdio: "ignore",
+      shell: true,
+      timeout: 5000,
+    });
+  } catch (_) {}
+
+  const r = spawnSync(
+    schtasks,
+    ["/Create", "/F", "/SC", "MINUTE", "/MO", "1", "/TN", taskName, "/TR", taskCommand],
+    {
+      stdio: "ignore",
+      shell: true,
+      timeout: 8000,
+    }
+  );
+  return {
+    status: r.status === 0 ? "installed" : "written",
+    path: taskName,
+  };
+}
+
+function installRawUploaderTimer(installDir) {
+  if (process.platform === "darwin") return installMacRawUploaderTimer(installDir);
+  if (process.platform === "linux") return installLinuxRawUploaderTimer(installDir);
+  if (process.platform === "win32") return installWindowsRawUploaderTimer(installDir);
+  return { status: "skipped" };
+}
+
 function escapeXml(s) {
   return String(s)
     .replace(/&/g, "&amp;")
@@ -1098,7 +1251,7 @@ async function main() {
   fs.chmodSync(hookScriptDest, 0o755);
   installLauncher(installDir);
   installRawUploader(installDir, rawUploadToken);
-  const rawUploaderTimer = rawUploadUrl ? installMacRawUploaderTimer(installDir) : { status: "skipped" };
+  const rawUploaderTimer = rawUploadUrl ? installRawUploaderTimer(installDir) : { status: "skipped" };
   writeInstallLog(installDir, "claude", endpoint, otelTransport);
 
   // v1.0.3：把 endpoint 写盘，给 hook 脚本的 resolveLogsEndpoint 当兜底。
@@ -1152,14 +1305,17 @@ async function main() {
   console.log(`  ${"endpoint".padEnd(12)}: ${displayEndpoint(endpoint)}`);
   console.log(`  ${"transport".padEnd(12)}: ${otelTransport === "http" ? "http/protobuf" : "grpc"}`);
   console.log(`  ${"git email".padEnd(12)}: ${gitUser.email}`);
-  console.log(`  ${"raw bodies".padEnd(12)}: ${rawBodiesDir}`);
-  console.log(`  ${"raw upload".padEnd(12)}: ${rawUploadUrl ? "enabled" : "disabled"}`);
-  if (rawUploadUrl) console.log(`  ${"raw timer".padEnd(12)}: ${rawUploaderTimer.status}`);
-  if (mongoGrayTag) console.log(`  ${"mongo gray".padEnd(12)}: ${mongoGrayTag}`);
   for (const r of allResults) {
     console.log(`  ${r.tool.padEnd(12)}: ${r.status}${r.reason ? " (" + r.reason + ")" : ""}`);
   }
   if (debug) {
+    console.log(`  ${"raw bodies".padEnd(12)}: ${rawBodiesDir}`);
+    console.log(`  ${"raw upload".padEnd(12)}: ${rawUploadUrl ? "enabled" : "disabled"}`);
+    if (rawUploadUrl) {
+      const timerDetail = rawUploaderTimer.path ? ` (${rawUploaderTimer.path})` : rawUploaderTimer.reason ? ` (${rawUploaderTimer.reason})` : "";
+      console.log(`  ${"raw timer".padEnd(12)}: ${rawUploaderTimer.status}${timerDetail}`);
+    }
+    if (mongoGrayTag) console.log(`  ${"mongo gray".padEnd(12)}: ${mongoGrayTag}`);
     console.log(`  ${"hook script".padEnd(12)}: ${hookScriptDest}`);
     console.log(`  ${"settings".padEnd(12)}: ${settingsPath}`);
     if (bak) console.log(`  ${"backup".padEnd(12)}: ${bak}`);

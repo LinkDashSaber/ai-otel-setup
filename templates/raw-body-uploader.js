@@ -228,6 +228,11 @@ function backoffMs(failures) {
   return steps[Math.min(Math.max(failures - 1, 0), steps.length - 1)] * 1000;
 }
 
+function errorText(err) {
+  if (!err) return "unknown";
+  return String(err.stack || err.message || err).slice(0, 500);
+}
+
 async function uploadFile(file, stat, cfg, token) {
   const base = rawUploadBase(cfg.rawUploadUrl);
   const machineId = cfg.machineId || cfg.machine_id || "";
@@ -400,7 +405,7 @@ async function run() {
           ...item,
           uploaded: false,
           failures,
-          lastError: e && e.message ? String(e.message).slice(0, 300) : "unknown",
+          lastError: errorText(e),
           lastAttemptAt: new Date().toISOString(),
           nextAttemptAt: Date.now() + backoffMs(failures),
         };
