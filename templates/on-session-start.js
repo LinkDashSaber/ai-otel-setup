@@ -81,6 +81,15 @@ function resolveLogsEndpoint() {
   return url.toString();
 }
 
+function readInstallerConfig() {
+  try {
+    const cfgPath = path.join(os.homedir(), ".claude", "cc-otel", "endpoint.json");
+    return JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+  } catch (_) {
+    return {};
+  }
+}
+
 // -------- 工具函数 ----------
 
 function readStdin() {
@@ -190,11 +199,19 @@ function anthropicRouteSnapshot() {
     logEvent("cc_hook_payload", event);
 
     const logsEndpoint = resolveLogsEndpoint();
+    const installerCfg = readInstallerConfig();
+    const resourceAttributes = [];
+    if (installerCfg.mongoGrayTag) {
+      resourceAttributes.push({
+        key: "ai_otel.mongo_gray",
+        value: { stringValue: String(installerCfg.mongoGrayTag) },
+      });
+    }
     const payload = JSON.stringify({
       resourceLogs: [
         {
           resource: {
-            attributes: [],
+            attributes: resourceAttributes,
           },
           scopeLogs: [
             {

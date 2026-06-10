@@ -1270,6 +1270,7 @@ async function main() {
       rawUploadUrl,
       rawUploadChunkBytes: 4 * 1024 * 1024,
       hasUploadToken: !!rawUploadToken,
+      mongoGrayTag,
       gitUserEmail: gitUser.email,
     })
   );
