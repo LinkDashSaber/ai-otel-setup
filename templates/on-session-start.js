@@ -26,7 +26,7 @@
 
 "use strict";
 
-const { execFileSync } = require("child_process");
+const { execFileSync, spawn } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -142,6 +142,30 @@ function anthropicRouteSnapshot() {
   };
 }
 
+// 仅在 mongoGrayTag 灰度安装时 spawn detached git-snapshot.js，不阻塞主 hook。
+// 节流、截断、POST 都在 snapshot 脚本里做。
+function spawnGitSnapshot(cfg, sessionId, hookKind, cwd) {
+  if (!cfg || !cfg.mongoGrayTag) return;
+  const snapshotPath = path.join(__dirname, "git-snapshot.js");
+  try {
+    if (!fs.existsSync(snapshotPath)) return;
+    const child = spawn(process.execPath, [
+      snapshotPath,
+      `--session-id=${sessionId}`,
+      `--hook-kind=${hookKind}`,
+      `--cwd=${cwd}`,
+    ], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    child.unref();
+    logEvent("git_snapshot_spawned", { hookKind, hasSessionId: !!sessionId });
+  } catch (e) {
+    logEvent("git_snapshot_spawn_failed", { error: (e && e.message) || "unknown" });
+  }
+}
+
 // -------- 主流程 ----------
 
 (async () => {
@@ -156,8 +180,20 @@ function anthropicRouteSnapshot() {
 
     const cwd = input.cwd || process.cwd();
     const sessionId = input.session_id || input.sessionId || ""; // MVP 实证：stdin.session_id = OTel session.id
-    // CC 在 stdin 里告诉脚本是哪个 hook 触发的；UserPromptSubmit 走"兜底"分支
-    const isPromptFallback = input.hook_event_name === "UserPromptSubmit";
+    // CC 在 stdin 里告诉脚本是哪个 hook 触发的；UserPromptSubmit 走"兜底"分支；Stop 仅做 git snapshot
+    const hookEventName = input.hook_event_name || "";
+    const isPromptFallback = hookEventName === "UserPromptSubmit";
+    const isStop = hookEventName === "Stop";
+
+    // Stop 分流：不再发主 hook_session_start（那是 SessionStart 干的事），
+    // 只在 mongoGrayTag 灰度时 spawn 一次 git snapshot（hook_kind=session_end）后退出。
+    if (isStop) {
+      const cfg = readInstallerConfig();
+      spawnGitSnapshot(cfg, sessionId, "session_end", cwd);
+      logEvent("cc_hook_stop_dispatched", { hasSessionId: !!sessionId });
+      process.exit(0);
+    }
+
     logEvent("cc_hook_start", {
       hookKind: isPromptFallback ? "user_prompt_fallback" : "session_start",
       hasSessionId: !!sessionId,
@@ -297,6 +333,10 @@ function anthropicRouteSnapshot() {
 
     req.write(payload);
     req.end();
+
+    // 仅在 mongoGrayTag 灰度安装时，spawn detached git snapshot 子进程（session_start）。
+    // 主 hook 不等 snapshot，setTimeout 兜底退出不影响 detached 子进程。
+    spawnGitSnapshot(installerCfg, sessionId, "session_start", cwd);
 
     // 兜底：2.5s 强制退出（CC hook timeout 3s 前先自己结束）
     setTimeout(done, 2500).unref();

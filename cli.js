@@ -94,6 +94,9 @@ const HOOK_ID = "team:session-start";
 // UserPromptSubmit 兜底 hook：复用同一脚本，靠 stdin.hook_event_name 分流；
 // 单独 id 是为了让 settings.json 的 SessionStart / UserPromptSubmit 数组各自能按 id 去重
 const PROMPT_HOOK_ID = "team:user-prompt-submit";
+// Stop hook：CC 每轮返回结束触发，灰度场景用来发 git_snapshot session_end；
+// 仍复用 on-session-start.js（按 hook_event_name=Stop 分流），便于幂等去重
+const STOP_HOOK_ID = "team:stop";
 const OTEL_KEYS = [
   "CLAUDE_CODE_ENABLE_TELEMETRY",
   "OTEL_METRICS_EXPORTER",
@@ -584,7 +587,7 @@ function buildEnv(template, args, endpoint, otelTransport, rawBodiesDir) {
   return env;
 }
 
-function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, noProxyEntries, gitUser, machineId, mongoGrayTag) {
+function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, stopHookEntry, noProxyEntries, gitUser, machineId, mongoGrayTag) {
   const merged = { ...existing };
 
   // env：plugin 优先（组织规范不允许个人改红线），但保留用户独有的 env
@@ -643,6 +646,16 @@ function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, noProxyEntr
     const keptUserPromptSubmit = userPromptSubmit.filter((h) => !isManagedClaudeHook(h, PROMPT_HOOK_ID));
     keptUserPromptSubmit.push(promptHookEntry);
     merged.hooks.UserPromptSubmit = keptUserPromptSubmit;
+  }
+
+  // hooks.Stop：每轮返回结束触发，灰度发 git_snapshot session_end，按 STOP_HOOK_ID 去重
+  if (stopHookEntry) {
+    const stop = Array.isArray(merged.hooks.Stop)
+      ? [...merged.hooks.Stop]
+      : [];
+    const keptStop = stop.filter((h) => !isManagedClaudeHook(h, STOP_HOOK_ID));
+    keptStop.push(stopHookEntry);
+    merged.hooks.Stop = keptStop;
   }
 
   return merged;
@@ -1250,10 +1263,30 @@ async function main() {
     id: PROMPT_HOOK_ID,
   };
 
+  // Stop hook：复用 on-session-start.js（按 hook_event_name=Stop 在脚本内分流）。
+  // 仅在 mongoGrayTag 灰度安装时实际触发 git snapshot；非灰度场景脚本会立即 noop 退出。
+  const stopHookEntry = {
+    matcher: "*",
+    hooks: [
+      {
+        type: "command",
+        command: buildHookCommand(launcherDest, hookScriptDest),
+        timeout: 3,
+      },
+    ],
+    description:
+      "ai-otel-setup 注入：Stop 触发 git snapshot（仅灰度 mongoGrayTag 时启用）",
+    id: STOP_HOOK_ID,
+  };
+
   fs.mkdirSync(installDir, { recursive: true });
   fs.copyFileSync(hookScriptSrc, hookScriptDest);
   fs.chmodSync(hookScriptDest, 0o755);
   installLauncher(installDir);
+  // git-snapshot.js：on-session-start.js spawn 出来的 detached 子进程脚本
+  const gitSnapshotDest = path.join(installDir, "git-snapshot.js");
+  fs.copyFileSync(path.join(templateDir, "git-snapshot.js"), gitSnapshotDest);
+  fs.chmodSync(gitSnapshotDest, 0o755);
   installRawUploader(installDir, rawUploadToken);
   const rawUploaderTimer = rawUploadUrl ? installRawUploaderTimer(installDir) : { status: "skipped" };
   writeInstallLog(installDir, "claude", endpoint, otelTransport);
@@ -1272,6 +1305,10 @@ async function main() {
       hasUploadToken: !!rawUploadToken,
       mongoGrayTag,
       gitUserEmail: gitUser.email,
+      // git-snapshot.js 读这三个字段做三轴截断；默认值在 snapshot 脚本内兜底
+      gitSnapshotMaxFiles: 20,
+      gitSnapshotMaxBytes: 1 * 1024 * 1024,
+      gitSnapshotPerFileBytes: 256 * 1024,
     })
   );
 
@@ -1282,6 +1319,7 @@ async function main() {
     newEnv,
     hookEntry,
     promptHookEntry,
+    stopHookEntry,
     buildNoProxyEntries(endpoint, otelTransport),
     gitUser,
     machineId,
@@ -1334,7 +1372,8 @@ async function main() {
         " 与 " +
         path.join(claudeDir, "cc-otel-state") +
         "（marker 目录），并从 settings.json 移除 12 个 OTEL_* env、" +
-        "SessionStart 中 id=" + HOOK_ID + " 与 UserPromptSubmit 中 id=" + PROMPT_HOOK_ID + " 的条目。"
+        "SessionStart 中 id=" + HOOK_ID + "、UserPromptSubmit 中 id=" + PROMPT_HOOK_ID +
+        "、Stop 中 id=" + STOP_HOOK_ID + " 的条目。"
     );
   }
 
