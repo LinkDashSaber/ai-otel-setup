@@ -40,8 +40,8 @@ try {
   // Logging is best effort; old installs may not have logging.js yet.
 }
 
-// UserPromptSubmit 节流窗口：2 分钟
-const PROMPT_THROTTLE_MS = 2 * 60 * 1000;
+// 节流移除（2026-06）：UserPromptSubmit 不再节流，每条 prompt 都触发 OTLP + git snapshot，
+// 配合 git-snapshot.js 里的 delta diff（仅"本次快照 vs 上次快照"）+ 三轴 1MB 截断兜底体积。
 
 // -------- 环境变量读取 ----------
 
@@ -144,8 +144,10 @@ function anthropicRouteSnapshot() {
 }
 
 // 仅在 fullUpload (--beta) 安装时 spawn detached git-snapshot.js，不阻塞主 hook。
-// 节流、截断、POST 都在 snapshot 脚本里做。
-function spawnGitSnapshot(cfg, sessionId, hookKind, cwd) {
+// 节流已移除（2026-06）；截断、POST、本地 snapshot ref 创建都在 snapshot 脚本里做。
+// hookKind 保留为旧字段（session_start | session_end）保持后端 query 兼容；
+// eventKind 是新字段（session_start | user_prompt | stop），细粒度区分。
+function spawnGitSnapshot(cfg, sessionId, hookKind, eventKind, cwd) {
   if (!cfg || cfg.fullUpload !== true) return;
   const snapshotPath = path.join(__dirname, "git-snapshot.js");
   try {
@@ -154,6 +156,7 @@ function spawnGitSnapshot(cfg, sessionId, hookKind, cwd) {
       snapshotPath,
       `--session-id=${sessionId}`,
       `--hook-kind=${hookKind}`,
+      `--event-kind=${eventKind}`,
       `--cwd=${cwd}`,
     ], {
       detached: true,
@@ -161,7 +164,7 @@ function spawnGitSnapshot(cfg, sessionId, hookKind, cwd) {
       windowsHide: true,
     });
     child.unref();
-    logEvent("git_snapshot_spawned", { hookKind, hasSessionId: !!sessionId });
+    logEvent("git_snapshot_spawned", { hookKind, eventKind, hasSessionId: !!sessionId });
   } catch (e) {
     logEvent("git_snapshot_spawn_failed", { error: (e && e.message) || "unknown" });
   }
@@ -213,7 +216,7 @@ function spawnLocalUsageScanner(cfg) {
     // 会让 detached 子进程数和 CPU 抖动放大；SessionStart 单点驱动已够覆盖每次启动。
     if (isStop) {
       const cfg = readInstallerConfig();
-      spawnGitSnapshot(cfg, sessionId, "session_end", cwd);
+      spawnGitSnapshot(cfg, sessionId, "session_end", "stop", cwd);
       logEvent("cc_hook_stop_dispatched", { hasSessionId: !!sessionId });
       process.exit(0);
     }
@@ -223,21 +226,8 @@ function spawnLocalUsageScanner(cfg) {
       hasSessionId: !!sessionId,
     });
 
-    // 兜底路径节流：sid 维度 2 分钟最多一次（marker 文件 mtime 判断）。
-    // 失败重试窗口同时由此控制：marker 过期后允许下次 prompt 再发一次。
-    const stateDir = path.join(os.homedir(), ".claude", "cc-otel-state");
-    const markerPath = sessionId ? path.join(stateDir, `sent-${sessionId}.flag`) : null;
-    if (isPromptFallback && markerPath && fs.existsSync(markerPath)) {
-      try {
-        const mtime = fs.statSync(markerPath).mtimeMs;
-        if (Date.now() - mtime < PROMPT_THROTTLE_MS) {
-          logEvent("cc_hook_skip", { reason: "prompt_throttled" });
-          process.exit(0);
-        }
-      } catch (_) {
-        // marker 状态读不到就当作过期，继续走上报
-      }
-    }
+    // 节流移除（2026-06）：UserPromptSubmit 不再 sid 维度节流，每条 prompt 都触发 OTLP。
+    // git snapshot 那条路也已同步移除内层 5min/60s 节流。
 
     const event = {
       "tool_kind": "cc",
@@ -344,24 +334,14 @@ function spawnLocalUsageScanner(cfg) {
       done();
     });
 
-    // 在真正发包前 touch marker 文件——把"已尝试上报"持久化下来，
-    // 让后续 2 分钟内的 UserPromptSubmit 跳过重复 POST。失败也照写，
-    // 因为 2 分钟后 marker 会过期允许重试，不会永久卡住。
-    if (markerPath) {
-      try {
-        fs.mkdirSync(stateDir, { recursive: true });
-        fs.writeFileSync(markerPath, "");
-      } catch (_) {
-        // marker 写入失败不阻塞上报
-      }
-    }
-
     req.write(payload);
     req.end();
 
-    // 仅在 fullUpload (--beta) 时 spawn detached git snapshot 子进程（session_start）。
+    // 仅在 fullUpload (--beta) 时 spawn detached git snapshot 子进程。
     // 主 hook 不等 snapshot，setTimeout 兜底退出不影响 detached 子进程。
-    spawnGitSnapshot(installerCfg, sessionId, "session_start", cwd);
+    // event_kind 区分 user_prompt vs session_start；hook_kind 保持旧值给后端兼容。
+    const eventKind = isPromptFallback ? "user_prompt" : "session_start";
+    spawnGitSnapshot(installerCfg, sessionId, "session_start", eventKind, cwd);
     // 全量装机默认 spawn detached local-usage-scanner（本地 token 用量补报，无门控）
     spawnLocalUsageScanner(installerCfg);
 
