@@ -356,6 +356,74 @@ function readUploadToken(installDir) {
   try { return fs.readFileSync(path.join(installDir, "raw-upload-token"), "utf8").trim(); } catch (_) { return ""; }
 }
 
+// 数字紧凑显示：<1000 原值，K/M/B 三位有效数字
+function compactNum(n) {
+  if (!Number.isFinite(n)) return "0";
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return (n / 1000).toFixed(n < 10_000 ? 1 : 0) + "K";
+  if (n < 1_000_000_000) return (n / 1_000_000).toFixed(n < 10_000_000 ? 1 : 0) + "M";
+  return (n / 1_000_000_000).toFixed(1) + "B";
+}
+
+// manual 模式：按 day × source 聚合 buckets 后打表（cc tokens / codex tokens / total）
+// token 总 = input + output + cache_read + cache_creation（每 bucket 四字段相加）
+// 包括没数据的 day（全 0 行），方便用户看使用节奏
+function printDailyTable(window, ccBuckets, codexBuckets) {
+  if (!OPTS.manual) return;
+  function dayKey(b) { return b.day; }
+  function tokens(b) { return (b.input || 0) + (b.output || 0) + (b.cache_r || 0) + (b.cache_w || 0); }
+  const ccByDay = new Map();
+  const cxByDay = new Map();
+  function accumulate(byDay, buckets) {
+    for (const b of buckets) {
+      let row = byDay.get(dayKey(b));
+      if (!row) { row = { sessions: new Set(), tokens: 0 }; byDay.set(dayKey(b), row); }
+      row.sessions.add(b.session_id);
+      row.tokens += tokens(b);
+    }
+  }
+  accumulate(ccByDay, ccBuckets);
+  accumulate(cxByDay, codexBuckets);
+
+  const cols = ["day", "CC sess", "CC tokens", "Codex sess", "Codex tokens", "Total tokens"];
+  const widths = [10, 7, 9, 10, 12, 12];
+  const pad = (s, w) => { const t = String(s); return t.length >= w ? t : t + " ".repeat(w - t.length); };
+  const writeRow = (vals) => process.stdout.write(vals.map((v, i) => pad(v, widths[i])).join("  ") + "\n");
+  const sep = () => process.stdout.write(widths.map((w) => "-".repeat(w)).join("  ") + "\n");
+
+  process.stdout.write(`\n=== 按日聚合（窗口 ${window.length} 天）===\n`);
+  writeRow(cols);
+  sep();
+
+  const totals = { ccSess: new Set(), ccTokens: 0, cxSess: new Set(), cxTokens: 0 };
+  for (const day of window) {
+    const cc = ccByDay.get(day) || { sessions: new Set(), tokens: 0 };
+    const cx = cxByDay.get(day) || { sessions: new Set(), tokens: 0 };
+    cc.sessions.forEach((s) => totals.ccSess.add(s));
+    cx.sessions.forEach((s) => totals.cxSess.add(s));
+    totals.ccTokens += cc.tokens;
+    totals.cxTokens += cx.tokens;
+    writeRow([
+      day,
+      cc.sessions.size,
+      compactNum(cc.tokens),
+      cx.sessions.size,
+      compactNum(cx.tokens),
+      compactNum(cc.tokens + cx.tokens),
+    ]);
+  }
+  sep();
+  writeRow([
+    "total",
+    totals.ccSess.size,
+    compactNum(totals.ccTokens),
+    totals.cxSess.size,
+    compactNum(totals.cxTokens),
+    compactNum(totals.ccTokens + totals.cxTokens),
+  ]);
+  process.stdout.write("\n");
+}
+
 /** rolls > MAX_ROLLS_PER_POST 时切批分发，所有批都 2xx 才认为成功 */
 async function postRollsBatched(url, baseEnvelope, source, rolls, token, timeoutMs) {
   if (rolls.length === 0) return { ok: true, batches: 0, totalRolls: 0 };
@@ -514,6 +582,7 @@ async function postRollsBatched(url, baseEnvelope, source, rolls, token, timeout
     }
 
     if (OPTS.manual) {
+      printDailyTable(window, ccBuckets, codexBuckets);
       const durationMs = Date.now() - startedAt;
       logEvent("local_usage_summary", {
         mode: OPTS.dryRun ? "dry-run" : "post",

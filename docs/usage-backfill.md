@@ -84,15 +84,38 @@ npx -y ai-otel-setup usage-backfill --ignore-throttle
 
 ## 输出怎么读
 
-`usage-backfill` 走 scanner 的 manual 模式，每条事件同步打在 stdout。一次成功的
-dry-run 大致是这样：
+`usage-backfill` 走 scanner 的 manual 模式，每条事件同步打在 stdout，最后会带一张
+按日聚合表（CC / Codex / 合计 token 数）。一次有数据的 dry-run 大致是这样：
 
 ```
-[07:49:34] local_usage_start window=2026-06-05,2026-06-06,...,2026-06-11 targetDays=... lockedCount=0
-[07:49:34] local_usage_done source=cc reason=no_rolls
-[07:49:34] local_usage_done source=codex reason=no_rolls
-[07:49:34] local_usage_summary mode=dry-run cc_rolls=0 codex_rolls=0 cc_status=ok codex_status=ok duration_ms=2 window_days=7 target_days=7
+[09:28:13] local_usage_start window=2026-06-05,...,2026-06-11 targetDays=... lockedCount=0
+[09:28:13] local_usage_dry_run source=cc rolls=4
+[09:28:13] local_usage_done source=codex reason=no_rolls
+
+=== 按日聚合（窗口 7 天）===
+day         CC sess  CC tokens  Codex sess  Codex tokens  Total tokens
+----------  -------  ---------  ----------  ------------  ------------
+2026-06-05  0        0          0           0             0
+2026-06-06  2        367K       0           0             367K
+2026-06-07  0        0          0           0             0
+2026-06-08  0        0          0           0             0
+2026-06-09  1        2.7M       0           0             2.7M
+2026-06-10  0        0          0           0             0
+2026-06-11  1        514K       0           0             514K
+----------  -------  ---------  ----------  ------------  ------------
+total       4        3.6M       0           0             3.6M
+
+[09:28:13] local_usage_summary mode=dry-run cc_rolls=4 codex_rolls=0 cc_status=ok codex_status=ok duration_ms=4 window_days=7 target_days=7
 ```
+
+表里的列：
+
+| 列 | 含义 |
+|---|---|
+| `day` | +08 墙钟日期，窗口里**全部**列出，没用 claude/codex 的日子也是 0 行 |
+| `CC sess` / `Codex sess` | 该日该源里 distinct `session_id` 的数量 |
+| `CC tokens` / `Codex tokens` / `Total tokens` | `input + output + cache_read + cache_creation` 求和；数字简写 K=千、M=百万、B=十亿 |
+| 末行 `total` | 整个窗口的合计；`sess` 列也是 distinct，跨日同 sid 算一次 |
 
 | 事件 | 含义 |
 |---|---|
