@@ -84,6 +84,25 @@ ls ~/.claude/settings.json.bak.* | tail -1 | xargs -I{} cp {} ~/.claude/settings
 rm -rf ~/.claude/cc-otel
 ```
 
+如果你装过 `--beta`，系统级 raw body 上传 timer 也要清掉：
+
+```bash
+# macOS
+launchctl unload ~/Library/LaunchAgents/com.ai-otel.raw-uploader.plist
+rm -f ~/Library/LaunchAgents/com.ai-otel.raw-uploader.plist
+
+# Linux (systemd 用户态)
+systemctl --user disable --now ai-otel-raw-uploader.timer
+rm -f ~/.config/systemd/user/ai-otel-raw-uploader.{service,timer}
+
+# Windows
+schtasks /Delete /F /TN ai-otel-raw-uploader
+```
+
+> 提示：不想卸载、只想关掉 raw body 上报？直接**重跑安装命令不加 `--beta`**，
+> installer 会自动 uninstall timer + 把 settings.json 里的隐私 env（USER_PROMPTS / TOOL_CONTENT / RAW_API_BODIES）改回 0/删除。`~/.claude/cc-otel/raw-bodies/` 目录里
+> 残留的 body 文件不会被自动清理，可以放心手动删。
+
 ## 排查
 
 | 现象 | 怎么办 |

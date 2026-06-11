@@ -594,7 +594,7 @@ function removeSessionSeenMarkers(installDir) {
 
 // ---------- 合并逻辑 ----------
 
-function buildEnv(template, args, endpoint, otelTransport, rawBodiesDir) {
+function buildEnv(template, args, endpoint, otelTransport, rawBodiesDir, fullUpload) {
   const env = { ...template.env };
   if (otelTransport === "http") {
     const logsEndpoint = logsEndpointFromGrpc(endpoint);
@@ -607,7 +607,13 @@ function buildEnv(template, args, endpoint, otelTransport, rawBodiesDir) {
   } else {
     env.OTEL_EXPORTER_OTLP_ENDPOINT = endpoint;
   }
-  if (env.OTEL_LOG_RAW_API_BODIES === "file:PLACEHOLDER_RAW_BODIES_DIR") {
+  // fullUpload (--beta) 时显式打开 3 个隐私 key + 写 RAW_API_BODIES 文件路径；
+  // 非 beta 模式由 settings.template.json 默认值兜底（USER_PROMPTS=0 / TOOL_CONTENT=0 / 不写 RAW_API_BODIES）。
+  // OTEL_KEYS 在 mergeSettings 里走 "has → overwrite，没有 → delete" 语义，所以
+  // 切回非 beta 时上一轮残留的 RAW_API_BODIES 会被自动清掉。
+  if (fullUpload) {
+    env.OTEL_LOG_USER_PROMPTS = "1";
+    env.OTEL_LOG_TOOL_CONTENT = "1";
     env.OTEL_LOG_RAW_API_BODIES = `file:${rawBodiesDir}`;
   }
   // OTEL_RESOURCE_ATTRIBUTES 由 mergeSettings 单独处理（parse-merge 用户已有 + 注入 git.user.*）
@@ -932,6 +938,7 @@ function installWindowsRawUploaderTimer(installDir) {
         stdio: ["ignore", "pipe", "ignore"],
         shell: true,
         timeout: 1000,
+        windowsHide: true,
       })
         .split(/\r?\n/)[0]
         .trim();
@@ -949,6 +956,7 @@ function installWindowsRawUploaderTimer(installDir) {
       stdio: "ignore",
       shell: true,
       timeout: 5000,
+      windowsHide: true,
     });
   } catch (_) {}
 
@@ -959,6 +967,7 @@ function installWindowsRawUploaderTimer(installDir) {
       stdio: "ignore",
       shell: true,
       timeout: 8000,
+      windowsHide: true,
     }
   );
   return {
@@ -971,6 +980,116 @@ function installRawUploaderTimer(installDir) {
   if (process.platform === "darwin") return installMacRawUploaderTimer(installDir);
   if (process.platform === "linux") return installLinuxRawUploaderTimer(installDir);
   if (process.platform === "win32") return installWindowsRawUploaderTimer(installDir);
+  return { status: "skipped" };
+}
+
+// 卸载之前装机留下的 raw-uploader timer。三种触发场景共用：
+//   1. 非 --beta 装机：每次都跑一次 uninstall，把残留干掉（幂等，没残留就 no-op）
+//   2. 重装 --beta 装机：install 之前先 uninstall（旧的 plist/unit 内容可能旧版本，刷新）
+//   3. （未来）显式 cleanup 子命令
+// 失败不抛错，最差就是 launchd/systemd/schtasks 里残一份；状态字段给主流程拿来打日志。
+function uninstallMacRawUploaderTimer() {
+  if (process.platform !== "darwin") return { status: "skipped" };
+  const launchctl = launchctlPath();
+  const plistPath = path.join(os.homedir(), "Library", "LaunchAgents", "com.ai-otel.raw-uploader.plist");
+  if (!fs.existsSync(plistPath) && !launchctl) return { status: "noop" };
+  if (launchctl && fs.existsSync(plistPath)) {
+    try {
+      spawnSync(launchctl, ["unload", plistPath], { stdio: "ignore", timeout: 3000 });
+    } catch (_) {}
+  }
+  try { if (fs.existsSync(plistPath)) fs.unlinkSync(plistPath); } catch (_) {}
+  return { status: "removed", path: plistPath };
+}
+
+function uninstallLinuxRawUploaderTimer() {
+  if (process.platform !== "linux") return { status: "skipped" };
+  const unitName = "ai-otel-raw-uploader";
+  const userSystemdDir = path.join(os.homedir(), ".config", "systemd", "user");
+  const servicePath = path.join(userSystemdDir, `${unitName}.service`);
+  const timerPath = path.join(userSystemdDir, `${unitName}.timer`);
+  const systemctl = (() => {
+    try {
+      return execFileSync("/usr/bin/which", ["systemctl"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1000,
+      }).trim();
+    } catch (_) { return ""; }
+  })();
+  if (systemctl) {
+    try {
+      spawnSync(systemctl, ["--user", "disable", "--now", `${unitName}.timer`], { stdio: "ignore", timeout: 5000 });
+    } catch (_) {}
+    try { spawnSync(systemctl, ["--user", "daemon-reload"], { stdio: "ignore", timeout: 5000 }); } catch (_) {}
+  }
+  try { if (fs.existsSync(timerPath)) fs.unlinkSync(timerPath); } catch (_) {}
+  try { if (fs.existsSync(servicePath)) fs.unlinkSync(servicePath); } catch (_) {}
+
+  // crontab 兜底：删带 marker 的行
+  const crontab = (() => {
+    try {
+      return execFileSync("/usr/bin/which", ["crontab"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1000,
+      }).trim();
+    } catch (_) { return ""; }
+  })();
+  if (crontab) {
+    let existing = "";
+    try {
+      existing = execFileSync(crontab, ["-l"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 3000,
+      });
+    } catch (_) {}
+    const cronMarker = "# ai-otel-raw-uploader";
+    if (existing.includes(cronMarker)) {
+      const lines = existing.split(/\r?\n/).map((l) => l.trimEnd()).filter((l) => l && !l.includes(cronMarker));
+      const payload = lines.length ? lines.join("\n") + "\n" : "";
+      try {
+        spawnSync(crontab, ["-"], {
+          input: payload,
+          encoding: "utf8",
+          stdio: ["pipe", "ignore", "ignore"],
+          timeout: 5000,
+        });
+      } catch (_) {}
+    }
+  }
+  return { status: "removed" };
+}
+
+function uninstallWindowsRawUploaderTimer() {
+  if (process.platform !== "win32") return { status: "skipped" };
+  const schtasks = (() => {
+    try {
+      return execFileSync("where", ["schtasks"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        shell: true,
+        timeout: 1000,
+        windowsHide: true,
+      }).split(/\r?\n/)[0].trim();
+    } catch (_) { return "schtasks"; }
+  })();
+  try {
+    spawnSync(schtasks, ["/Delete", "/F", "/TN", "ai-otel-raw-uploader"], {
+      stdio: "ignore",
+      shell: true,
+      timeout: 5000,
+      windowsHide: true,
+    });
+  } catch (_) {}
+  return { status: "removed" };
+}
+
+function uninstallRawUploaderTimer() {
+  if (process.platform === "darwin") return uninstallMacRawUploaderTimer();
+  if (process.platform === "linux") return uninstallLinuxRawUploaderTimer();
+  if (process.platform === "win32") return uninstallWindowsRawUploaderTimer();
   return { status: "skipped" };
 }
 
@@ -1308,16 +1427,16 @@ async function main() {
   // 下次发版（灰度结束）时把默认翻转成 true，opt-out 改 --no-full-upload。
   const fullUpload = truthyFlag(args.beta) || truthyFlag(args["full-upload"]);
   const explicitRawUploadUrl = normalizeOptionalUrl(args["upload-url"] || args.uploadurl);
-  const rawUploadUrl =
-    explicitRawUploadUrl ||
-    (fullUpload || rawUploadToken ? rawUploadUrlFromEndpoint(endpoint) : "");
-  fs.mkdirSync(rawBodiesDir, { recursive: true, mode: 0o700 });
-  try {
-    fs.chmodSync(rawBodiesDir, 0o700);
-  } catch (_) {
-    // Best effort on Windows / restrictive filesystems.
+  // rawUploadUrl 唯一来源：fullUpload（--beta）；显式 --upload-url 仍可强制覆盖。
+  // 非 beta 用户不需要这个 URL，scanner/raw-body-uploader 都不会跑。
+  const rawUploadUrl = explicitRawUploadUrl || (fullUpload ? rawUploadUrlFromEndpoint(endpoint) : "");
+  // raw-bodies 目录只在 fullUpload 时建（CC 才会写盘 raw API body）；
+  // 非 beta 用户曾经装过 beta 的话，目录里残留文件保留，由用户手动清。
+  if (fullUpload) {
+    fs.mkdirSync(rawBodiesDir, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(rawBodiesDir, 0o700); } catch (_) {}
   }
-  const newEnv = buildEnv(settingsTemplate, args, endpoint, otelTransport, rawBodiesDir);
+  const newEnv = buildEnv(settingsTemplate, args, endpoint, otelTransport, rawBodiesDir, fullUpload);
 
   const hookEntry = {
     matcher: "*",
@@ -1378,8 +1497,14 @@ async function main() {
   const localUsageScannerDest = path.join(installDir, "local-usage-scanner.js");
   fs.copyFileSync(path.join(templateDir, "local-usage-scanner.js"), localUsageScannerDest);
   fs.chmodSync(localUsageScannerDest, 0o755);
-  installRawUploader(installDir, rawUploadToken);
-  const rawUploaderTimer = rawUploadUrl ? installRawUploaderTimer(installDir) : { status: "skipped" };
+  // installRawUploader 同时管 raw-body-uploader.js 脚本 + raw-upload-token 文件：
+  //   - fullUpload=true：写 token（如果用户传了 --upload-token）
+  //   - fullUpload=false：传空 token 让它把残留 token 删干净
+  installRawUploader(installDir, fullUpload ? rawUploadToken : "");
+  // Timer 生命周期：先无脑 uninstall 一次（幂等，对没装过的也是 no-op），
+  // 再按 fullUpload 决定要不要 install。这样 true → false 重装能自动卸 timer。
+  uninstallRawUploaderTimer();
+  const rawUploaderTimer = fullUpload ? installRawUploaderTimer(installDir) : { status: "skipped" };
   writeInstallLog(installDir, "claude", endpoint, otelTransport);
 
   // v1.0.3：把 endpoint 写盘，给 hook 脚本的 resolveLogsEndpoint 当兜底。
