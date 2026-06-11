@@ -193,6 +193,22 @@ function deriveRawUploadHost(hostname) {
   return parts.join(".");
 }
 
+// local-usage-scanner POST 目标：复用 rawUploadUrl 的 hostname，端口固定 8082，路径 /v1/local-usage
+// 由 forwarder 单独 listener 接收（独立 MySQL sink）
+function deriveLocalUsageUrl(rawUrl) {
+  try {
+    if (!rawUrl) return "";
+    const u = new URL(rawUrl);
+    u.port = "8082";
+    u.pathname = "/v1/local-usage";
+    u.search = "";
+    u.hash = "";
+    return u.toString().replace(/\/+$/, "");
+  } catch (_) {
+    return "";
+  }
+}
+
 function rawUploadUrlFromEndpoint(endpoint) {
   try {
     const logsUrl = new URL(logsEndpointFromGrpc(endpoint));
@@ -1287,6 +1303,10 @@ async function main() {
   const gitSnapshotDest = path.join(installDir, "git-snapshot.js");
   fs.copyFileSync(path.join(templateDir, "git-snapshot.js"), gitSnapshotDest);
   fs.chmodSync(gitSnapshotDest, 0o755);
+  // local-usage-scanner.js：同样由 on-session-start.js spawn 出来的 detached 子进程
+  const localUsageScannerDest = path.join(installDir, "local-usage-scanner.js");
+  fs.copyFileSync(path.join(templateDir, "local-usage-scanner.js"), localUsageScannerDest);
+  fs.chmodSync(localUsageScannerDest, 0o755);
   installRawUploader(installDir, rawUploadToken);
   const rawUploaderTimer = rawUploadUrl ? installRawUploaderTimer(installDir) : { status: "skipped" };
   writeInstallLog(installDir, "claude", endpoint, otelTransport);
@@ -1309,6 +1329,8 @@ async function main() {
       gitSnapshotMaxFiles: 20,
       gitSnapshotMaxBytes: 1 * 1024 * 1024,
       gitSnapshotPerFileBytes: 256 * 1024,
+      // local-usage-scanner.js 读这个 URL 上报本地用量；从 rawUploadUrl 派生（同 hostname，端口换 8082，路径换 /v1/local-usage）
+      localUsageUrl: deriveLocalUsageUrl(rawUploadUrl),
     })
   );
 

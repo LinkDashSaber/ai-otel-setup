@@ -167,6 +167,25 @@ function spawnGitSnapshot(cfg, sessionId, hookKind, cwd) {
   }
 }
 
+// 仅在 mongoGrayTag 灰度安装时 spawn detached local-usage-scanner.js。
+// 本身有 5min/machine_id 节流，Stop / SessionStart 高频触发不会重复扫。
+function spawnLocalUsageScanner(cfg) {
+  if (!cfg || !cfg.mongoGrayTag) return;
+  const scannerPath = path.join(__dirname, "local-usage-scanner.js");
+  try {
+    if (!fs.existsSync(scannerPath)) return;
+    const child = spawn(process.execPath, [scannerPath], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    child.unref();
+    logEvent("local_usage_spawned", {});
+  } catch (e) {
+    logEvent("local_usage_spawn_failed", { error: (e && e.message) || "unknown" });
+  }
+}
+
 // -------- 主流程 ----------
 
 (async () => {
@@ -191,6 +210,7 @@ function spawnGitSnapshot(cfg, sessionId, hookKind, cwd) {
     if (isStop) {
       const cfg = readInstallerConfig();
       spawnGitSnapshot(cfg, sessionId, "session_end", cwd);
+      spawnLocalUsageScanner(cfg);
       logEvent("cc_hook_stop_dispatched", { hasSessionId: !!sessionId });
       process.exit(0);
     }
@@ -338,6 +358,8 @@ function spawnGitSnapshot(cfg, sessionId, hookKind, cwd) {
     // 仅在 mongoGrayTag 灰度安装时，spawn detached git snapshot 子进程（session_start）。
     // 主 hook 不等 snapshot，setTimeout 兜底退出不影响 detached 子进程。
     spawnGitSnapshot(installerCfg, sessionId, "session_start", cwd);
+    // 同样灰度门控：spawn detached local-usage-scanner（本地 token 用量补报）
+    spawnLocalUsageScanner(installerCfg);
 
     // 兜底：2.5s 强制退出（CC hook timeout 3s 前先自己结束）
     setTimeout(done, 2500).unref();
