@@ -56,49 +56,19 @@ npx -y ai-otel-setup url=collector服务地址
 
 ## 本地用量补报（默认开启，v1.0.32+）
 
-为了让看板的 Token 用量统计更完整（CC 原生 OTel 偶尔丢日志），安装器会在每次 `claude` 启动时
-扫描本机 `~/.claude/projects/**/*.jsonl` 和 `~/.codex/sessions/**/*.jsonl` 近 7 天数据，
-按"日 × session × model"聚合 token 数后 POST 给团队 Forward。
+补全 Claude Code 原生 OTel 偶尔漏报的 token 数据。安装器在每次 `claude` 启动时扫本机
+`~/.claude/projects` 和 `~/.codex/sessions` 近 7 天的 jsonl，**只上报 token 数字汇总**
+（不读对话、不读代码、不读工具入参），POST 给团队 Forward。装完会立即在后台跑一次首发补报。
 
-- **完全本地聚合**，只上报数值汇总：`messages` / `input_tokens` / `output_tokens` / `cache_read_tokens` / `cache_creation_tokens` 以及 `session_id` / `model` / `workspace_name`（cwd basename）/ `git_remote`（origin URL）/ `hostname` / `git_user_email`。
-- **不读对话内容、不读工具入参、不读代码**。
-- 由 detached 子进程跑，主流程不阻塞；同机 5 分钟节流，单次最长 20s 后自停，超时 60s 强退。
-- 历史 6 天有本地 lock 文件锁定不重算；只有今天的数据每次 SessionStart 重算并 upsert。
+不想被采：装机时加 `--no-local-usage`。
 
-不想被补报：装机时加 `--no-local-usage`：
+手动立刻触发一次补报：
 
 ```bash
-npx -y ai-otel-setup url=collector服务地址 --no-local-usage
-```
-
-或重装时去掉这个参数即可恢复默认开启。
-
-### 手动触发补报
-
-如果想立刻补一次（比如换了新机器、看板缺数据），可以不走 hook 直接触发：
-
-```bash
-# 默认行为：扫近 7 天，受节流和历史 lock 限制
 npx -y ai-otel-setup usage-backfill
-
-# 强制全量重扫 + 自定义窗口
-npx -y ai-otel-setup usage-backfill --window=30 --force
-
-# 只算不发，看看会发出去什么
-npx -y ai-otel-setup usage-backfill --window=30 --dry-run
 ```
 
-| 子参数 | 说明 |
-|---|---|
-| `--window=N` | 扫描近 N 天（默认 7，上限 30）。 |
-| `--dry-run` | 算出 buckets 后只 print 统计，不发包，也不更新本地 lock。 |
-| `--force` | 等同于 `--ignore-throttle --ignore-lock`，绕过 5 分钟节流和历史天锁。 |
-| `--ignore-throttle` | 跳过 5 分钟同机节流。 |
-| `--ignore-lock` | 跳过历史天 lock，重扫所有 day。 |
-
-> 必须先正常装机一次（`npx -y ai-otel-setup url=...`），才有 scanner 可调用。
->
-> 完整命令参考、输出怎么读、排查表见 [docs/usage-backfill.md](docs/usage-backfill.md)。
+完整说明（参数表、输出怎么读、排查）见 [docs/usage-backfill.md](docs/usage-backfill.md)。
 
 ## 本地日志
 
