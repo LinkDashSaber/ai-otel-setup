@@ -97,6 +97,8 @@ npx -y ai-otel-setup usage-backfill --window=30 --dry-run
 | `--ignore-lock` | 跳过历史天 lock，重扫所有 day。 |
 
 > 必须先正常装机一次（`npx -y ai-otel-setup url=...`），才有 scanner 可调用。
+>
+> 完整命令参考、输出怎么读、排查表见 [docs/usage-backfill.md](docs/usage-backfill.md)。
 
 ## 本地日志
 
