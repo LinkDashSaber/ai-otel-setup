@@ -37,7 +37,6 @@ npx -y ai-otel-setup url=collector服务地址
 | `url`（必填） | 服务器地址。可填 IP / 域名，或完整地址。裸 IP 会按本地测试规则生成 `http://IP:4317`；裸域名会按生产规则生成 `https://域名:24317`。不能包含空格或逗号。 |
 | `--http` / `http=1` | Claude Code 原生 OTel 使用 OTLP/HTTP。默认使用此模式，logs 指向 `/v1/logs`，metrics 指向 `/v1/metrics`。 |
 | `--grpc` / `grpc=1` | 强制 Claude Code 原生 OTel 使用 gRPC，作为 HTTP 上报异常时的 fallback。 |
-| `--no-local-usage` | 关闭"本地用量补报"功能（默认开启，详见下文）。 |
 
 ## 安装后会做什么
 
@@ -54,13 +53,9 @@ npx -y ai-otel-setup url=collector服务地址
 | 会采集 | 调用了哪些工具、每次耗时、是否成功、Token 用量、当前目录、Git 信息 |
 | 不采集 | 你输入的提示词、代码正文、工具入参、API 原始内容 |
 
-## 本地用量补报（默认开启，v1.0.32+）
+## 本地用量补报
 
-补全 Claude Code 原生 OTel 偶尔漏报的 token 数据。安装器在每次 `claude` 启动时扫本机
-`~/.claude/projects` 和 `~/.codex/sessions` 近 7 天的 jsonl，**只上报 token 数字汇总**
-（不读对话、不读代码、不读工具入参），POST 给团队 Forward。装完会立即在后台跑一次首发补报。
-
-不想被采：装机时加 `--no-local-usage`。
+补全 Claude Code 原生 OTel 偶尔漏报的 token 数据。装完会立即在后台跑一次首发补报。
 
 手动立刻触发一次补报：
 

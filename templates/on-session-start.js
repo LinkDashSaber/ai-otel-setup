@@ -169,11 +169,9 @@ function spawnGitSnapshot(cfg, sessionId, hookKind, cwd) {
 
 // 全量装机默认 spawn detached local-usage-scanner.js（仅 SessionStart 触发，
 // 不再放到 Stop 分支，避免每轮 turn 多次 spawn 浪费 CPU / handle）。
-// 用户级 opt-out：endpoint.json.localUsageEnabled === false 时跳过。
 // 节流由 scanner 自身 5min/machine_id 控制。
 function spawnLocalUsageScanner(cfg) {
   if (!cfg) return;
-  if (cfg.localUsageEnabled === false) return;
   if (!cfg.localUsageUrl) return;
   const scannerPath = path.join(__dirname, "local-usage-scanner.js");
   try {

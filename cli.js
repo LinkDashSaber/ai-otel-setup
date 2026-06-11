@@ -1304,8 +1304,6 @@ async function main() {
   const rawUploadUrl =
     explicitRawUploadUrl ||
     (mongoGrayTag || rawUploadToken ? rawUploadUrlFromEndpoint(endpoint) : "");
-  // 本地用量补报全量开放：默认 enabled，--no-local-usage 关闭
-  const localUsageEnabled = !truthyFlag(args["no-local-usage"]);
   fs.mkdirSync(rawBodiesDir, { recursive: true, mode: 0o700 });
   try {
     fs.chmodSync(rawBodiesDir, 0o700);
@@ -1398,8 +1396,6 @@ async function main() {
       // local-usage-scanner.js 读这个 URL 上报本地用量；从主 endpoint 独立派生
       // （与 rawUploadUrl 同 hostname，但不再受 mongoGrayTag/upload-token 门控）
       localUsageUrl: deriveLocalUsageUrl(endpoint),
-      // 用户级 opt-out：默认 true（全量开放）；--no-local-usage 装机时设为 false
-      localUsageEnabled,
     })
   );
 
@@ -1450,9 +1446,7 @@ async function main() {
       console.log(`  ${"raw timer".padEnd(12)}: ${rawUploaderTimer.status}${timerDetail}`);
     }
     if (mongoGrayTag) console.log(`  ${"mongo gray".padEnd(12)}: ${mongoGrayTag}`);
-    if (localUsageEnabled) {
-      console.log(`  ${"usage url".padEnd(12)}: ${deriveLocalUsageUrl(endpoint) || "(empty)"}`);
-    }
+    console.log(`  ${"usage url".padEnd(12)}: ${deriveLocalUsageUrl(endpoint) || "(empty)"}`);
     console.log(`  ${"hook script".padEnd(12)}: ${hookScriptDest}`);
     console.log(`  ${"settings".padEnd(12)}: ${settingsPath}`);
     if (bak) console.log(`  ${"backup".padEnd(12)}: ${bak}`);
@@ -1464,21 +1458,19 @@ async function main() {
   // 让用户当天就能在看板看到数据，不必等首次 SessionStart。--ignore-throttle/lock
   // 避免被刚装机时的旧 marker 卡住；走默认 7 天窗口，重度回补让用户自己跑
   // `npx -y ai-otel-setup usage-backfill --window=30 --force`。
-  if (localUsageEnabled) {
-    try {
-      const scannerPath = path.join(installDir, "local-usage-scanner.js");
-      if (fs.existsSync(scannerPath)) {
-        const child = spawn(process.execPath, [scannerPath, "--ignore-throttle", "--ignore-lock"], {
-          detached: true,
-          stdio: "ignore",
-          windowsHide: true,
-        });
-        child.unref();
-        console.log("已在后台触发首次本地用量补报，扫近 7 天 jsonl；日志见 ~/.claude/cc-otel/ai-otel.log。");
-      }
-    } catch (_) {
-      // 补报失败不阻塞装机；用户后续可手动 `npx -y ai-otel-setup usage-backfill`
+  try {
+    const scannerPath = path.join(installDir, "local-usage-scanner.js");
+    if (fs.existsSync(scannerPath)) {
+      const child = spawn(process.execPath, [scannerPath, "--ignore-throttle", "--ignore-lock"], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      child.unref();
+      console.log("已在后台触发首次本地用量补报，扫近 7 天 jsonl；日志见 ~/.claude/cc-otel/ai-otel.log。");
     }
+  } catch (_) {
+    // 补报失败不阻塞装机；用户后续可手动 `npx -y ai-otel-setup usage-backfill`
   }
 
   if (debug) {

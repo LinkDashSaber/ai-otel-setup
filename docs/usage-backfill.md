@@ -124,7 +124,7 @@ total       4        3.6M       0           0             3.6M
 | `local_usage_post_ok` | 真发 POST 成功，含批次数和总 rolls 数 |
 | `local_usage_post_fail` | POST 失败，含 HTTP 状态码和错误片段 |
 | `local_usage_dry_run` | `--dry-run` 时算完 buckets 跳过 POST |
-| `local_usage_skip` | 整体被 skip，看 `reason` 字段：`throttled` / `user_opted_out` / `no_localUsageUrl` / `no_machine_id` |
+| `local_usage_skip` | 整体被 skip，看 `reason` 字段：`throttled` / `no_localUsageUrl` / `no_machine_id` |
 | `local_usage_summary` | manual 模式结束摘要，含 mode / rolls / status / duration |
 | `local_usage_watchdog_killed` | 跑超过 10min 被强退（manual 模式 watchdog） |
 | `local_usage_error` | 异常退出，看 `error` 字段 |
@@ -145,26 +145,12 @@ total       4        3.6M       0           0             3.6M
 
 ---
 
-## opt-out
-
-如果你不想被这个功能扫描，装机时加 `--no-local-usage`：
-
-```bash
-npx -y ai-otel-setup url=ai-otel.xfinfr.com --no-local-usage
-```
-
-`endpoint.json` 会写 `localUsageEnabled: false`，之后无论 hook 还是
-`usage-backfill` 都会 skip。重装时去掉这个参数即可恢复默认开启。
-
----
-
 ## 排查
 
 | 现象 | 怎么办 |
 |---|---|
 | 跑了之后没 stdout 输出 | scanner 没收到 `--manual`，说明 ai-otel-setup 版本 < 1.0.32，先升级 |
 | `local_usage_skip reason=throttled` | 5min 节流命中，加 `--ignore-throttle` 或 `--force` |
-| `local_usage_skip reason=user_opted_out` | 装机时加过 `--no-local-usage`，重装不加这个参数即可 |
 | `local_usage_skip reason=no_localUsageUrl` | `endpoint.json.localUsageUrl` 没派生出来，多半是装机时 url 参数没填对，重装一次 |
 | `local_usage_post_fail status=429` | 服务端 per-IP rate limit（60 req/min/IP），等一分钟再试 |
 | `local_usage_post_fail status=400` | envelope 校验失败，看 `error` 字段；常见是某条 roll 的 `day` 超出 `[today-30d, today+1d]` 窗口 |

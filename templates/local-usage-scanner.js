@@ -7,7 +7,7 @@
  *
  * 关键约束：
  *   - 由 on-session-start.js spawn 出来的 detached 子进程，主 hook 不阻塞
- *   - 全量装机默认运行；endpoint.json.localUsageEnabled === false 时 skip（用户级 opt-out）
+ *   - 全量装机默认运行（无 opt-out）
  *   - 5 分钟同 machine_id 内只跑一次（防 SessionStart 高频触发）
  *   - 历史 6 天用 lock 文件跳过；今天总是重算并 upsert
  *   - 失败不冒泡：任何异常都不阻塞主 hook
@@ -453,12 +453,7 @@ async function postRollsBatched(url, baseEnvelope, source, rolls, token, timeout
   try {
     const installDir = __dirname;
     const cfg = readJSONSafe(path.join(installDir, "endpoint.json"));
-    // v1.0.32：去除 mongoGrayTag 门控，全量装机默认运行。
-    // 用户级 opt-out：localUsageEnabled === false 时跳过；老配置无此字段视同 true。
-    if (cfg.localUsageEnabled === false) {
-      logEvent("local_usage_skip", { reason: "user_opted_out" });
-      return;
-    }
+    // v1.0.32：去除 mongoGrayTag 门控，全量装机默认运行（无 opt-out）。
     if (!cfg.localUsageUrl) {
       logEvent("local_usage_skip", { reason: "no_localUsageUrl" });
       return;
