@@ -61,6 +61,7 @@ function safeGit(cwd, args, timeoutMs) {
       stdio: ["ignore", "pipe", "ignore"],
       timeout: timeoutMs,
       maxBuffer: 32 * 1024 * 1024,
+      windowsHide: true,
     }).toString();
   } catch (_) {
     return "";

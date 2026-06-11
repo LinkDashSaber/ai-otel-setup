@@ -257,7 +257,7 @@ let nodeBin = process.execPath;
 try {
   // -v 只打版本号立即退出，用来探 PATH 上是否有可执行 node。
   // timeout 防 PATH 上的 "node" 是个会卡住的 wrapper（极少见但存在）。
-  execFileSync("node", ["-v"], { stdio: "ignore", timeout: 1500 });
+  execFileSync("node", ["-v"], { stdio: "ignore", timeout: 1500, windowsHide: true });
   nodeBin = "node";
 } catch (_) {
   // PATH 上没 node 或探测失败 → 沿用当前进程 execPath（即 installer 焊死的那条
@@ -275,7 +275,7 @@ logEvent("hook_launcher_start", {
   ...hookEnvSnapshot(),
   ...settingsTelemetrySnapshot(__dirname),
 });
-const r = spawnSync(nodeBin, [scriptPath], { stdio: "inherit" });
+const r = spawnSync(nodeBin, [scriptPath], { stdio: "inherit", windowsHide: true });
 logEvent("hook_launcher_exit", {
   script: path.basename(scriptPath),
   status: r.status === null ? 1 : r.status,

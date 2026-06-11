@@ -110,6 +110,7 @@ function safeGit(args) {
     return execFileSync("git", args, {
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 1000,
+      windowsHide: true,
     })
       .toString()
       .trim();
