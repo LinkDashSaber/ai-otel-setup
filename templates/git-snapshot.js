@@ -304,6 +304,7 @@ function createSnapshotCommit(cwd, sessionId, eventKind, ts, promptId) {
     const sessionId = args["session-id"] || "";
     const hookKind = args["hook-kind"] || "session_start"; // 旧字段（兼容）
     const eventKind = args["event-kind"] || hookKind;      // 新字段（细粒度）
+    const promptUuid = args["prompt-id"] || "";            // CC 原生 prompt.id（从 transcript 反查）
     const cwd = args["cwd"] || process.cwd();
     const cfg = readJSONSafe(path.join(__dirname, "endpoint.json"));
 
@@ -373,8 +374,11 @@ function createSnapshotCommit(cwd, sessionId, eventKind, ts, promptId) {
       "session.id": sessionId,
       "hook_kind": hookKind,                              // legacy
       "snapshot.event_kind": eventKind,                   // new: session_start|user_prompt|stop
-      "snapshot.prompt_id": promptId,                     // new: p_0, p_1, ...
-      "snapshot.seq": String(ts),                         // new: unix_ms（ref 名里的那个数）
+      // CC 原生 prompt UUID（跟 user_prompt / api_request* event 的 prompt.id 完全一致；
+      // 后端按它 join 就能把 hook_git_snapshot 跟 prompt 的全部 OTel 事件串起来）
+      "prompt.id": promptUuid,
+      "snapshot.prompt_seq": promptId,                    // 我们派生的 session 内序号 p_0/p_1/...
+      "snapshot.seq": String(ts),                         // unix_ms（ref 名里的那个数）
       "snapshot.is_first_frame": String(isFirstFrame),
       "snapshot.workspace": cwd,
       "snapshot.git_branch": branch || "",
@@ -438,7 +442,8 @@ function createSnapshotCommit(cwd, sessionId, eventKind, ts, promptId) {
       truncatedFileCount: truncatedFiles.length,
       hookKind,
       eventKind,
-      promptId,
+      promptSeq: promptId,
+      hasPromptUuid: !!promptUuid,
       hasSnapshotRef: !!(snap && snap.refname),
       isFirstFrame,
       treeUnchanged,

@@ -143,28 +143,61 @@ function anthropicRouteSnapshot() {
   };
 }
 
+// 反向读 transcript jsonl，倒序找最近一条 type=user 的 promptId（CC 原生 prompt UUID）。
+// CC 的 hook stdin 不暴露 prompt.id，但 transcript_path 指向的 jsonl 里每个 user
+// message 都带 promptId 字段，跟 OTel user_prompt / api_request* event 的 prompt.id
+// 完全一致——后端就可以用它把 hook_git_snapshot 跟 api_* 串起来。
+//
+// 性能：只读文件末尾 64KB（不受 transcript 总大小影响），同步 IO 但单次 < 5ms。
+function readPromptIdFromTranscript(transcriptPath) {
+  if (!transcriptPath) return "";
+  try {
+    if (!fs.existsSync(transcriptPath)) return "";
+    const fd = fs.openSync(transcriptPath, "r");
+    try {
+      const size = fs.fstatSync(fd).size;
+      const readBytes = Math.min(64 * 1024, size);
+      const buf = Buffer.alloc(readBytes);
+      fs.readSync(fd, buf, 0, readBytes, size - readBytes);
+      const lines = buf.toString("utf8").split("\n");
+      // 倒序找最近的 type=user + promptId
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (!lines[i]) continue;
+        try {
+          const r = JSON.parse(lines[i]);
+          if (r && r.type === "user" && r.promptId) return r.promptId;
+        } catch (_) { /* 半截行或损坏行，跳过 */ }
+      }
+      return "";
+    } finally { fs.closeSync(fd); }
+  } catch (_) { return ""; }
+}
+
 // 仅在 fullUpload (--beta) 安装时 spawn detached git-snapshot.js，不阻塞主 hook。
 // 节流已移除（2026-06）；截断、POST、本地 snapshot ref 创建都在 snapshot 脚本里做。
 // hookKind 保留为旧字段（session_start | session_end）保持后端 query 兼容；
 // eventKind 是新字段（session_start | user_prompt | stop），细粒度区分。
-function spawnGitSnapshot(cfg, sessionId, hookKind, eventKind, cwd) {
+// promptUuid 是 CC 原生 prompt.id（从 transcript 反查得来），首帧可为空。
+function spawnGitSnapshot(cfg, sessionId, hookKind, eventKind, cwd, promptUuid) {
   if (!cfg || cfg.fullUpload !== true) return;
   const snapshotPath = path.join(__dirname, "git-snapshot.js");
   try {
     if (!fs.existsSync(snapshotPath)) return;
-    const child = spawn(process.execPath, [
+    const args = [
       snapshotPath,
       `--session-id=${sessionId}`,
       `--hook-kind=${hookKind}`,
       `--event-kind=${eventKind}`,
       `--cwd=${cwd}`,
-    ], {
+    ];
+    if (promptUuid) args.push(`--prompt-id=${promptUuid}`);
+    const child = spawn(process.execPath, args, {
       detached: true,
       stdio: "ignore",
       windowsHide: true,
     });
     child.unref();
-    logEvent("git_snapshot_spawned", { hookKind, eventKind, hasSessionId: !!sessionId });
+    logEvent("git_snapshot_spawned", { hookKind, eventKind, hasSessionId: !!sessionId, hasPromptUuid: !!promptUuid });
   } catch (e) {
     logEvent("git_snapshot_spawn_failed", { error: (e && e.message) || "unknown" });
   }
@@ -205,6 +238,7 @@ function spawnLocalUsageScanner(cfg) {
 
     const cwd = input.cwd || process.cwd();
     const sessionId = input.session_id || input.sessionId || ""; // MVP 实证：stdin.session_id = OTel session.id
+    const transcriptPath = input.transcript_path || ""; // CC 写的 jsonl，含每个 user message 的 promptId（= OTel prompt.id）
     // CC 在 stdin 里告诉脚本是哪个 hook 触发的；UserPromptSubmit 走"兜底"分支；Stop 仅做 git snapshot
     const hookEventName = input.hook_event_name || "";
     const isPromptFallback = hookEventName === "UserPromptSubmit";
@@ -216,8 +250,10 @@ function spawnLocalUsageScanner(cfg) {
     // 会让 detached 子进程数和 CPU 抖动放大；SessionStart 单点驱动已够覆盖每次启动。
     if (isStop) {
       const cfg = readInstallerConfig();
-      spawnGitSnapshot(cfg, sessionId, "session_end", "stop", cwd);
-      logEvent("cc_hook_stop_dispatched", { hasSessionId: !!sessionId });
+      // Stop 时 transcript 末尾必有触发本次 stop 的那个 user message，反查 promptId
+      const promptUuid = readPromptIdFromTranscript(transcriptPath);
+      spawnGitSnapshot(cfg, sessionId, "session_end", "stop", cwd, promptUuid);
+      logEvent("cc_hook_stop_dispatched", { hasSessionId: !!sessionId, hasPromptUuid: !!promptUuid });
       process.exit(0);
     }
 
@@ -340,8 +376,11 @@ function spawnLocalUsageScanner(cfg) {
     // 仅在 fullUpload (--beta) 时 spawn detached git snapshot 子进程。
     // 主 hook 不等 snapshot，setTimeout 兜底退出不影响 detached 子进程。
     // event_kind 区分 user_prompt vs session_start；hook_kind 保持旧值给后端兼容。
+    // promptUuid：UserPromptSubmit 时 transcript 已写入该 prompt 的 user message；
+    // SessionStart 时 transcript 通常还没 user message，readPromptIdFromTranscript 返回 ""，OK。
     const eventKind = isPromptFallback ? "user_prompt" : "session_start";
-    spawnGitSnapshot(installerCfg, sessionId, "session_start", eventKind, cwd);
+    const promptUuid = readPromptIdFromTranscript(transcriptPath);
+    spawnGitSnapshot(installerCfg, sessionId, "session_start", eventKind, cwd, promptUuid);
     // 全量装机默认 spawn detached local-usage-scanner（本地 token 用量补报，无门控）
     spawnLocalUsageScanner(installerCfg);
 
