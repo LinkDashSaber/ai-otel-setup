@@ -23,7 +23,7 @@ const path = require("path");
 const os = require("os");
 const net = require("net");
 const crypto = require("crypto");
-const { execFileSync, spawnSync } = require("child_process");
+const { execFileSync, spawn, spawnSync } = require("child_process");
 
 const PKG_VERSION = require("./package.json").version;
 
@@ -1439,7 +1439,6 @@ async function main() {
   console.log(`  ${"endpoint".padEnd(12)}: ${displayEndpoint(endpoint)}`);
   console.log(`  ${"transport".padEnd(12)}: ${otelTransport === "http" ? "http/protobuf" : "grpc"}`);
   console.log(`  ${"git email".padEnd(12)}: ${gitUser.email}`);
-  console.log(`  ${"local usage".padEnd(12)}: ${localUsageEnabled ? "enabled (用 --no-local-usage 关闭)" : "disabled"}`);
   for (const r of allResults) {
     console.log(`  ${r.tool.padEnd(12)}: ${r.status}${r.reason ? " (" + r.reason + ")" : ""}`);
   }
@@ -1460,6 +1459,28 @@ async function main() {
   }
   console.log("");
   console.log("接下来：直接运行 `claude` / `codex` / `gemini`，下次会话启动即自动上报。");
+
+  // 装完立刻在后台 spawn 一次本地用量补报（detached + stdio:ignore + windowsHide），
+  // 让用户当天就能在看板看到数据，不必等首次 SessionStart。--ignore-throttle/lock
+  // 避免被刚装机时的旧 marker 卡住；走默认 7 天窗口，重度回补让用户自己跑
+  // `npx -y ai-otel-setup usage-backfill --window=30 --force`。
+  if (localUsageEnabled) {
+    try {
+      const scannerPath = path.join(installDir, "local-usage-scanner.js");
+      if (fs.existsSync(scannerPath)) {
+        const child = spawn(process.execPath, [scannerPath, "--ignore-throttle", "--ignore-lock"], {
+          detached: true,
+          stdio: "ignore",
+          windowsHide: true,
+        });
+        child.unref();
+        console.log("已在后台触发首次本地用量补报，扫近 7 天 jsonl；日志见 ~/.claude/cc-otel/ai-otel.log。");
+      }
+    } catch (_) {
+      // 补报失败不阻塞装机；用户后续可手动 `npx -y ai-otel-setup usage-backfill`
+    }
+  }
+
   if (debug) {
     console.log(
       "卸载：删除 " +

@@ -469,7 +469,9 @@ async function postRollsBatched(url, baseEnvelope, source, rolls, token, timeout
       return;
     }
     const nowMs = Date.now();
-    if (!OPTS.ignoreThrottle && !throttleCheck(machineId, nowMs)) {
+    // dry-run 不 POST、不写 lock，对 forwarder 零影响，所以也免受 5min 节流卡。
+    // --ignore-throttle 显式开关同样跳过；二者任一为真就完全 bypass，连 marker 也不写。
+    if (!OPTS.dryRun && !OPTS.ignoreThrottle && !throttleCheck(machineId, nowMs)) {
       logEvent("local_usage_skip", { reason: "throttled" });
       return;
     }

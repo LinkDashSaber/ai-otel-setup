@@ -50,7 +50,7 @@ Usage: npx -y ai-otel-setup usage-backfill [选项]
 |---|---|
 | `npx -y ai-otel-setup usage-backfill` | 默认：扫近 7 天，受 5min 节流和历史天 lock 限制 |
 | `npx -y ai-otel-setup usage-backfill --window=N` | 扫近 N 天，默认 7，上限 30 |
-| `npx -y ai-otel-setup usage-backfill --dry-run` | 算 buckets 后只 print 统计，**不发 POST，不更新本地 lock** |
+| `npx -y ai-otel-setup usage-backfill --dry-run` | 算 buckets 后只 print 统计，**不发 POST，不更新本地 lock，也自动跳过 5 分钟节流** |
 | `npx -y ai-otel-setup usage-backfill --ignore-throttle` | 跳过 5 分钟同机节流（适合刚跑过想立刻再跑一次） |
 | `npx -y ai-otel-setup usage-backfill --ignore-lock` | 跳过历史天 lock，强制重扫每个 day |
 | `npx -y ai-otel-setup usage-backfill --force` | 等于 `--ignore-throttle --ignore-lock` |
