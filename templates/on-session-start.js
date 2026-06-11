@@ -143,10 +143,10 @@ function anthropicRouteSnapshot() {
   };
 }
 
-// 仅在 mongoGrayTag 灰度安装时 spawn detached git-snapshot.js，不阻塞主 hook。
+// 仅在 fullUpload (--beta) 安装时 spawn detached git-snapshot.js，不阻塞主 hook。
 // 节流、截断、POST 都在 snapshot 脚本里做。
 function spawnGitSnapshot(cfg, sessionId, hookKind, cwd) {
-  if (!cfg || !cfg.mongoGrayTag) return;
+  if (!cfg || cfg.fullUpload !== true) return;
   const snapshotPath = path.join(__dirname, "git-snapshot.js");
   try {
     if (!fs.existsSync(snapshotPath)) return;
@@ -208,7 +208,7 @@ function spawnLocalUsageScanner(cfg) {
     const isStop = hookEventName === "Stop";
 
     // Stop 分流：不再发主 hook_session_start（那是 SessionStart 干的事），
-    // 只在 mongoGrayTag 灰度时 spawn 一次 git snapshot（hook_kind=session_end）后退出。
+    // 只在 fullUpload (--beta) 时 spawn 一次 git snapshot（hook_kind=session_end）后退出。
     // 注意：local-usage-scanner 不在 Stop 触发——Stop 是每轮 turn 都触发的高频事件，
     // 会让 detached 子进程数和 CPU 抖动放大；SessionStart 单点驱动已够覆盖每次启动。
     if (isStop) {
@@ -261,10 +261,11 @@ function spawnLocalUsageScanner(cfg) {
     const logsEndpoint = resolveLogsEndpoint();
     const installerCfg = readInstallerConfig();
     const resourceAttributes = [];
-    if (installerCfg.mongoGrayTag) {
+    if (installerCfg.fullUpload === true) {
+      // 服务端 mongo-full sink 当前仍按此 attr 过滤，attr 名暂保留为 ai_otel.mongo_gray=beta
       resourceAttributes.push({
         key: "ai_otel.mongo_gray",
-        value: { stringValue: String(installerCfg.mongoGrayTag) },
+        value: { stringValue: "beta" },
       });
     }
     const payload = JSON.stringify({
@@ -358,10 +359,10 @@ function spawnLocalUsageScanner(cfg) {
     req.write(payload);
     req.end();
 
-    // 仅在 mongoGrayTag 灰度安装时，spawn detached git snapshot 子进程（session_start）。
+    // 仅在 fullUpload (--beta) 时 spawn detached git snapshot 子进程（session_start）。
     // 主 hook 不等 snapshot，setTimeout 兜底退出不影响 detached 子进程。
     spawnGitSnapshot(installerCfg, sessionId, "session_start", cwd);
-    // 同样灰度门控：spawn detached local-usage-scanner（本地 token 用量补报）
+    // 全量装机默认 spawn detached local-usage-scanner（本地 token 用量补报，无门控）
     spawnLocalUsageScanner(installerCfg);
 
     // 兜底：2.5s 强制退出（CC hook timeout 3s 前先自己结束）

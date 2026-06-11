@@ -614,7 +614,7 @@ function buildEnv(template, args, endpoint, otelTransport, rawBodiesDir) {
   return env;
 }
 
-function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, stopHookEntry, noProxyEntries, gitUser, machineId, mongoGrayTag) {
+function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, stopHookEntry, noProxyEntries, gitUser, machineId, fullUpload) {
   const merged = { ...existing };
 
   // env：plugin 优先（组织规范不允许个人改红线），但保留用户独有的 env
@@ -634,9 +634,10 @@ function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, stopHookEnt
   if (machineId) {
     const attrs = parseResourceAttrs(merged.env.OTEL_RESOURCE_ATTRIBUTES || "");
     attrs["ai_otel.machine_id"] = machineId;
-    // 显式 set 或 delete，让"重装时不传 mongo-gray = 彻底卸下 beta"成立。
-    // 之前只 set 不 delete，导致老 OTEL_RESOURCE_ATTRIBUTES 里的 mongo_gray=beta 残留。
-    if (mongoGrayTag) attrs["ai_otel.mongo_gray"] = mongoGrayTag;
+    // 全量上报开启：写 ai_otel.mongo_gray=beta（服务端 mongo-full sink 当前
+    // 仍按此 attr 过滤，故 attr 名暂保留；下次发版服务端改完后可一起改名）。
+    // 关闭：显式 delete，让"--beta 重装 → 不 --beta 重装"能彻底卸下。
+    if (fullUpload) attrs["ai_otel.mongo_gray"] = "beta";
     else delete attrs["ai_otel.mongo_gray"];
     merged.env.OTEL_RESOURCE_ATTRIBUTES = serializeResourceAttrs(attrs);
   }
@@ -1302,11 +1303,14 @@ async function main() {
   const machineId = getOrCreateMachineId(installDir);
   const rawBodiesDir = path.join(installDir, "raw-bodies");
   const rawUploadToken = args["upload-token"] || args.uploadtoken || "";
-  const mongoGrayTag = normalizeOptionalTag(args["mongo-gray"] || args.mongogray);
+  // 全量数据上报开关（替代旧的 mongo-gray=beta 概念）。
+  // 当前灰度阶段：默认 false；--beta（或 full-upload=true）显式开。
+  // 下次发版（灰度结束）时把默认翻转成 true，opt-out 改 --no-full-upload。
+  const fullUpload = truthyFlag(args.beta) || truthyFlag(args["full-upload"]);
   const explicitRawUploadUrl = normalizeOptionalUrl(args["upload-url"] || args.uploadurl);
   const rawUploadUrl =
     explicitRawUploadUrl ||
-    (mongoGrayTag || rawUploadToken ? rawUploadUrlFromEndpoint(endpoint) : "");
+    (fullUpload || rawUploadToken ? rawUploadUrlFromEndpoint(endpoint) : "");
   fs.mkdirSync(rawBodiesDir, { recursive: true, mode: 0o700 });
   try {
     fs.chmodSync(rawBodiesDir, 0o700);
@@ -1347,7 +1351,7 @@ async function main() {
   };
 
   // Stop hook：复用 on-session-start.js（按 hook_event_name=Stop 在脚本内分流）。
-  // 仅在 mongoGrayTag 灰度安装时实际触发 git snapshot；非灰度场景脚本会立即 noop 退出。
+  // 仅在 fullUpload (--beta) 时实际触发 git snapshot；非全量场景脚本会立即 noop 退出。
   const stopHookEntry = {
     matcher: "*",
     hooks: [
@@ -1358,7 +1362,7 @@ async function main() {
       },
     ],
     description:
-      "ai-otel-setup 注入：Stop 触发 git snapshot（仅灰度 mongoGrayTag 时启用）",
+      "ai-otel-setup 注入：Stop 触发 git snapshot（仅 --beta 全量上报时启用）",
     id: STOP_HOOK_ID,
   };
 
@@ -1390,14 +1394,14 @@ async function main() {
       rawUploadUrl,
       rawUploadChunkBytes: 4 * 1024 * 1024,
       hasUploadToken: !!rawUploadToken,
-      mongoGrayTag,
+      fullUpload,
       gitUserEmail: gitUser.email,
       // git-snapshot.js 读这三个字段做三轴截断；默认值在 snapshot 脚本内兜底
       gitSnapshotMaxFiles: 20,
       gitSnapshotMaxBytes: 1 * 1024 * 1024,
       gitSnapshotPerFileBytes: 256 * 1024,
       // local-usage-scanner.js 读这个 URL 上报本地用量；从主 endpoint 独立派生
-      // （与 rawUploadUrl 同 hostname，但不再受 mongoGrayTag/upload-token 门控）
+      // （与 rawUploadUrl 同 hostname，不受 fullUpload / upload-token 门控）
       localUsageUrl: deriveLocalUsageUrl(endpoint),
     })
   );
@@ -1413,7 +1417,7 @@ async function main() {
     buildNoProxyEntries(endpoint, otelTransport),
     gitUser,
     machineId,
-    mongoGrayTag
+    fullUpload
   );
   writeJSONAtomic(settingsPath, merged);
 
@@ -1448,7 +1452,7 @@ async function main() {
       const timerDetail = rawUploaderTimer.path ? ` (${rawUploaderTimer.path})` : rawUploaderTimer.reason ? ` (${rawUploaderTimer.reason})` : "";
       console.log(`  ${"raw timer".padEnd(12)}: ${rawUploaderTimer.status}${timerDetail}`);
     }
-    if (mongoGrayTag) console.log(`  ${"mongo gray".padEnd(12)}: ${mongoGrayTag}`);
+    if (fullUpload) console.log(`  ${"mode".padEnd(12)}: beta (full upload)`);
     console.log(`  ${"usage url".padEnd(12)}: ${deriveLocalUsageUrl(endpoint) || "(empty)"}`);
     console.log(`  ${"hook script".padEnd(12)}: ${hookScriptDest}`);
     console.log(`  ${"settings".padEnd(12)}: ${settingsPath}`);
@@ -1502,7 +1506,7 @@ function printUsage() {
 可选：
   --http | http=1    Claude Code 原生 OTel 使用 OTLP/HTTP（默认）
   --grpc | grpc=1    Claude Code 原生 OTel 强制使用 gRPC（fallback）
-  mongo-gray=TAG     给 OTEL_RESOURCE_ATTRIBUTES 注入 ai_otel.mongo_gray=TAG，用于服务端全量旁路灰度
+  --beta             开启全量数据上报旁路（raw body + git snapshot），灰度阶段须显式传入
   upload-url=URL     raw body 上传入口，例如 https://host/v1/raw-bodies；灰度安装时不传会按 url 自动推导 raw-upload 域名
   upload-token=TOKEN raw body 上传 Bearer token（可选；仅服务端开启鉴权时需要，传入时写入本地 0600 token 文件）
   debug=1 | --debug   显示安装路径、备份路径与卸载提示

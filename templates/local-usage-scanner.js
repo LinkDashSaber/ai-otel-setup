@@ -496,7 +496,7 @@ async function postRollsBatched(url, baseEnvelope, source, rolls, token, timeout
       installer_version: cfg.installerVersion || "",
       git_user_email: cfg.gitUserEmail || "",
       hostname: os.hostname() || "",
-      mongo_gray: cfg.mongoGrayTag || "",
+      mongo_gray: cfg.fullUpload === true ? "beta" : "",
       today_local: today,
       window_days: WINDOW_DAYS,
     };

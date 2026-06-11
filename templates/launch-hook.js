@@ -113,9 +113,10 @@ function runAutoUpdate(installDir) {
     const installArgs = ["-y", `${PACKAGE_NAME}@${latestVersion}`, `url=${cfg.endpoint}`];
     if (cfg.otelTransport === "http") installArgs.push("--http");
     if (cfg.otelTransport === "grpc" && process.platform === "win32") installArgs.push("--grpc");
-    // 透传 mongo-gray，保留用户首次装机时的 beta 灰度选择；不传等于 auto-update
-    // 把 beta 抹掉（mergeSettings 会 delete 残留的 ai_otel.mongo_gray attr）
-    if (cfg.mongoGrayTag) installArgs.push(`mongo-gray=${cfg.mongoGrayTag}`);
+    // 透传 --beta：保留用户首次装机时的全量上报选择。fullUpload 是新字段（v1.1.0+），
+    // mongoGrayTag 是老字段（≤v1.0.x 残留），二者任一为真即认为应继续全量。
+    // 不传等于 auto-update 抹掉 beta（mergeSettings 会 delete 残留的 ai_otel.mongo_gray attr）。
+    if (cfg.fullUpload === true || cfg.mongoGrayTag) installArgs.push("--beta");
     runNpmToolSync("npx", installArgs, {
       stdio: "ignore",
       timeout: 120000,

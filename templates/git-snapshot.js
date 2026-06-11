@@ -3,8 +3,8 @@
  * git-snapshot.js
  *
  * 在 hook session_start / session_end 触发后，detached 收集工作区 git 快照
- * 并通过 OTLP/HTTP 上报。仅在 endpoint.json.mongoGrayTag 真值时由
- * on-session-start.js spawn 出来（灰度全量旁路场景）。
+ * 并通过 OTLP/HTTP 上报。仅在 endpoint.json.fullUpload === true 时由
+ * on-session-start.js spawn 出来（--beta 全量上报场景）。
  *
  * 关键约束：
  *   - detached 子进程，主 hook 不阻塞
@@ -194,8 +194,8 @@ function throttleCheck(sessionId, hookKind) {
     const cwd = args["cwd"] || process.cwd();
     const cfg = readJSONSafe(path.join(__dirname, "endpoint.json"));
 
-    if (!cfg.mongoGrayTag) {
-      logEvent("git_snapshot_skip", { reason: "no_mongo_gray" });
+    if (cfg.fullUpload !== true) {
+      logEvent("git_snapshot_skip", { reason: "not_full_upload" });
       return;
     }
     if (!throttleCheck(sessionId, hookKind)) {
@@ -260,10 +260,11 @@ function throttleCheck(sessionId, hookKind) {
     };
 
     const resourceAttributes = [];
-    if (cfg.mongoGrayTag) {
+    if (cfg.fullUpload === true) {
+      // 服务端 mongo-full sink 按 ai_otel.mongo_gray=beta 过滤；attr 名暂保留
       resourceAttributes.push({
         key: "ai_otel.mongo_gray",
-        value: { stringValue: String(cfg.mongoGrayTag) },
+        value: { stringValue: "beta" },
       });
     }
 
