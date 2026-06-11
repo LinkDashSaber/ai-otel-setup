@@ -24,6 +24,7 @@ try {
 const PACKAGE_NAME = "ai-otel-setup";
 const UPDATE_CHECK_INTERVAL_MS = 2 * 60 * 60 * 1000;
 const UPDATE_RETRY_INTERVAL_MS = 10 * 60 * 1000;
+const RAW_UPLOAD_TRIGGER_INTERVAL_MS = 2 * 60 * 1000;
 
 function readJSONSafe(file) {
   try {
@@ -112,6 +113,10 @@ function runAutoUpdate(installDir) {
     const installArgs = ["-y", `${PACKAGE_NAME}@${latestVersion}`, `url=${cfg.endpoint}`];
     if (cfg.otelTransport === "http") installArgs.push("--http");
     if (cfg.otelTransport === "grpc" && process.platform === "win32") installArgs.push("--grpc");
+    // 透传 --beta：保留用户首次装机时的全量上报选择。fullUpload 是新字段（v1.1.0+），
+    // mongoGrayTag 是老字段（≤v1.0.x 残留），二者任一为真即认为应继续全量。
+    // 不传等于 auto-update 抹掉 beta（mergeSettings 会 delete 残留的 ai_otel.mongo_gray attr）。
+    if (cfg.fullUpload === true || cfg.mongoGrayTag) installArgs.push("--beta");
     runNpmToolSync("npx", installArgs, {
       stdio: "ignore",
       timeout: 120000,
@@ -173,6 +178,41 @@ function maybeSpawnAutoUpdate(nodeBin, installDir) {
   }
 }
 
+function maybeSpawnRawUploader(nodeBin, installDir) {
+  const uploaderPath = path.join(installDir, "raw-body-uploader.js");
+  if (!fs.existsSync(uploaderPath)) return;
+
+  const cfg = readJSONSafe(path.join(installDir, "endpoint.json"));
+  if (!cfg.rawUploadUrl) return;
+
+  const statePath = path.join(installDir, "raw-uploader-trigger-state.json");
+  const state = readJSONSafe(statePath);
+  const now = Date.now();
+  const lastAttemptAt = Number(state.lastAttemptAt || 0);
+  if (lastAttemptAt && now - lastAttemptAt < RAW_UPLOAD_TRIGGER_INTERVAL_MS) return;
+  if (!writeJSONSafe(statePath, { ...state, lastAttemptAt: now, lastResult: "scheduled" })) return;
+
+  try {
+    const child = spawn(nodeBin, [uploaderPath, "--once", "--max-runtime=25"], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    child.unref();
+    logEvent("raw_uploader_scheduled", { reason: "hook_trigger" });
+  } catch (e) {
+    writeJSONSafe(statePath, {
+      ...state,
+      lastAttemptAt: now,
+      lastResult: "spawn-failed",
+      lastError: e && e.message ? String(e.message).slice(0, 300) : "unknown",
+    });
+    logEvent("raw_uploader_spawn_failed", {
+      error: e && e.message ? e.message : "unknown",
+    });
+  }
+}
+
 function hookEnvSnapshot() {
   return {
     hookEnvTelemetryEnabled: process.env.CLAUDE_CODE_ENABLE_TELEMETRY === "1",
@@ -221,7 +261,7 @@ let nodeBin = process.execPath;
 try {
   // -v 只打版本号立即退出，用来探 PATH 上是否有可执行 node。
   // timeout 防 PATH 上的 "node" 是个会卡住的 wrapper（极少见但存在）。
-  execFileSync("node", ["-v"], { stdio: "ignore", timeout: 1500 });
+  execFileSync("node", ["-v"], { stdio: "ignore", timeout: 1500, windowsHide: true });
   nodeBin = "node";
 } catch (_) {
   // PATH 上没 node 或探测失败 → 沿用当前进程 execPath（即 installer 焊死的那条
@@ -231,6 +271,7 @@ try {
 }
 
 maybeSpawnAutoUpdate(nodeBin, __dirname);
+maybeSpawnRawUploader(nodeBin, __dirname);
 
 const startedAt = Date.now();
 logEvent("hook_launcher_start", {
@@ -238,7 +279,7 @@ logEvent("hook_launcher_start", {
   ...hookEnvSnapshot(),
   ...settingsTelemetrySnapshot(__dirname),
 });
-const r = spawnSync(nodeBin, [scriptPath], { stdio: "inherit" });
+const r = spawnSync(nodeBin, [scriptPath], { stdio: "inherit", windowsHide: true });
 logEvent("hook_launcher_exit", {
   script: path.basename(scriptPath),
   status: r.status === null ? 1 : r.status,

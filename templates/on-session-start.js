@@ -3,8 +3,8 @@
  * SessionStart / UserPromptSubmit 兜底 hook
  *
  * 职责：
- *   采集 CC 原生 OTel 不覆盖的 5 个字段（cwd / git_remote / git_user_email /
- *   git_user_name / hostname），通过 OTLP/HTTP 4318 发给 Collector，
+ *   采集 CC 原生 OTel 不覆盖的字段（cwd / git_remote / git_user_email /
+ *   git_user_name / hostname / ANTHROPIC_BASE_URL route snapshot），通过 OTLP/HTTP 4318 发给 Collector，
  *   与 OTel 主流合流。
  *
  * 双 hook 复用同一脚本：
@@ -26,7 +26,7 @@
 
 "use strict";
 
-const { execFileSync } = require("child_process");
+const { execFileSync, spawn } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -40,8 +40,8 @@ try {
   // Logging is best effort; old installs may not have logging.js yet.
 }
 
-// UserPromptSubmit 节流窗口：2 分钟
-const PROMPT_THROTTLE_MS = 2 * 60 * 1000;
+// 节流移除（2026-06）：UserPromptSubmit 不再节流，每条 prompt 都触发 OTLP + git snapshot，
+// 配合 git-snapshot.js 里的 delta diff（仅"本次快照 vs 上次快照"）+ 三轴 1MB 截断兜底体积。
 
 // -------- 环境变量读取 ----------
 
@@ -81,6 +81,15 @@ function resolveLogsEndpoint() {
   return url.toString();
 }
 
+function readInstallerConfig() {
+  try {
+    const cfgPath = path.join(os.homedir(), ".claude", "cc-otel", "endpoint.json");
+    return JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+  } catch (_) {
+    return {};
+  }
+}
+
 // -------- 工具函数 ----------
 
 function readStdin() {
@@ -101,11 +110,117 @@ function safeGit(args) {
     return execFileSync("git", args, {
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 1000,
+      windowsHide: true,
     })
       .toString()
       .trim();
   } catch (_) {
     return null;
+  }
+}
+
+function normalizedOrigin(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  try {
+    const url = new URL(value);
+    return `${url.protocol}//${url.host}`;
+  } catch (_) {
+    // Fall back to a conservative, query-free origin-like value so
+    // path/query/userinfo are not reported.
+    return value
+      .replace(/^[^:]+:\/\//, (m) => m.toLowerCase())
+      .replace(/[?#].*$/, "")
+      .replace(/\/+$/, "")
+      .slice(0, 200);
+  }
+}
+
+function anthropicRouteSnapshot() {
+  const anthropicBaseUrl = normalizedOrigin(process.env.ANTHROPIC_BASE_URL);
+  return {
+    "anthropic_base_url": anthropicBaseUrl,
+  };
+}
+
+// 反向读 transcript jsonl，倒序找最近一条 type=user 的 promptId（CC 原生 prompt UUID）。
+// CC 的 hook stdin 不暴露 prompt.id，但 transcript_path 指向的 jsonl 里每个 user
+// message 都带 promptId 字段，跟 OTel user_prompt / api_request* event 的 prompt.id
+// 完全一致——后端就可以用它把 hook_git_snapshot 跟 api_* 串起来。
+//
+// 性能：只读文件末尾 64KB（不受 transcript 总大小影响），同步 IO 但单次 < 5ms。
+function readPromptIdFromTranscript(transcriptPath) {
+  if (!transcriptPath) return "";
+  try {
+    if (!fs.existsSync(transcriptPath)) return "";
+    const fd = fs.openSync(transcriptPath, "r");
+    try {
+      const size = fs.fstatSync(fd).size;
+      const readBytes = Math.min(64 * 1024, size);
+      const buf = Buffer.alloc(readBytes);
+      fs.readSync(fd, buf, 0, readBytes, size - readBytes);
+      const lines = buf.toString("utf8").split("\n");
+      // 倒序找最近的 type=user + promptId
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (!lines[i]) continue;
+        try {
+          const r = JSON.parse(lines[i]);
+          if (r && r.type === "user" && r.promptId) return r.promptId;
+        } catch (_) { /* 半截行或损坏行，跳过 */ }
+      }
+      return "";
+    } finally { fs.closeSync(fd); }
+  } catch (_) { return ""; }
+}
+
+// 仅在 fullUpload (--beta) 安装时 spawn detached git-snapshot.js，不阻塞主 hook。
+// 节流已移除（2026-06）；截断、POST、本地 snapshot ref 创建都在 snapshot 脚本里做。
+// hookKind 保留为旧字段（session_start | session_end）保持后端 query 兼容；
+// eventKind 是新字段（session_start | user_prompt | stop），细粒度区分。
+// promptUuid 是 CC 原生 prompt.id（从 transcript 反查得来），首帧可为空。
+function spawnGitSnapshot(cfg, sessionId, hookKind, eventKind, cwd, promptUuid) {
+  if (!cfg || cfg.fullUpload !== true) return;
+  const snapshotPath = path.join(__dirname, "git-snapshot.js");
+  try {
+    if (!fs.existsSync(snapshotPath)) return;
+    const args = [
+      snapshotPath,
+      `--session-id=${sessionId}`,
+      `--hook-kind=${hookKind}`,
+      `--event-kind=${eventKind}`,
+      `--cwd=${cwd}`,
+    ];
+    if (promptUuid) args.push(`--prompt-id=${promptUuid}`);
+    const child = spawn(process.execPath, args, {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    child.unref();
+    logEvent("git_snapshot_spawned", { hookKind, eventKind, hasSessionId: !!sessionId, hasPromptUuid: !!promptUuid });
+  } catch (e) {
+    logEvent("git_snapshot_spawn_failed", { error: (e && e.message) || "unknown" });
+  }
+}
+
+// 全量装机默认 spawn detached local-usage-scanner.js（仅 SessionStart 触发，
+// 不再放到 Stop 分支，避免每轮 turn 多次 spawn 浪费 CPU / handle）。
+// 节流由 scanner 自身 5min/machine_id 控制。
+function spawnLocalUsageScanner(cfg) {
+  if (!cfg) return;
+  if (!cfg.localUsageUrl) return;
+  const scannerPath = path.join(__dirname, "local-usage-scanner.js");
+  try {
+    if (!fs.existsSync(scannerPath)) return;
+    const child = spawn(process.execPath, [scannerPath], {
+      detached: true,
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    child.unref();
+    logEvent("local_usage_spawned", {});
+  } catch (e) {
+    logEvent("local_usage_spawn_failed", { error: (e && e.message) || "unknown" });
   }
 }
 
@@ -123,28 +238,32 @@ function safeGit(args) {
 
     const cwd = input.cwd || process.cwd();
     const sessionId = input.session_id || input.sessionId || ""; // MVP 实证：stdin.session_id = OTel session.id
-    // CC 在 stdin 里告诉脚本是哪个 hook 触发的；UserPromptSubmit 走"兜底"分支
-    const isPromptFallback = input.hook_event_name === "UserPromptSubmit";
+    const transcriptPath = input.transcript_path || ""; // CC 写的 jsonl，含每个 user message 的 promptId（= OTel prompt.id）
+    // CC 在 stdin 里告诉脚本是哪个 hook 触发的；UserPromptSubmit 走"兜底"分支；Stop 仅做 git snapshot
+    const hookEventName = input.hook_event_name || "";
+    const isPromptFallback = hookEventName === "UserPromptSubmit";
+    const isStop = hookEventName === "Stop";
+
+    // Stop 分流：不再发主 hook_session_start（那是 SessionStart 干的事），
+    // 只在 fullUpload (--beta) 时 spawn 一次 git snapshot（hook_kind=session_end）后退出。
+    // 注意：local-usage-scanner 不在 Stop 触发——Stop 是每轮 turn 都触发的高频事件，
+    // 会让 detached 子进程数和 CPU 抖动放大；SessionStart 单点驱动已够覆盖每次启动。
+    if (isStop) {
+      const cfg = readInstallerConfig();
+      // Stop 时 transcript 末尾必有触发本次 stop 的那个 user message，反查 promptId
+      const promptUuid = readPromptIdFromTranscript(transcriptPath);
+      spawnGitSnapshot(cfg, sessionId, "session_end", "stop", cwd, promptUuid);
+      logEvent("cc_hook_stop_dispatched", { hasSessionId: !!sessionId, hasPromptUuid: !!promptUuid });
+      process.exit(0);
+    }
+
     logEvent("cc_hook_start", {
       hookKind: isPromptFallback ? "user_prompt_fallback" : "session_start",
       hasSessionId: !!sessionId,
     });
 
-    // 兜底路径节流：sid 维度 2 分钟最多一次（marker 文件 mtime 判断）。
-    // 失败重试窗口同时由此控制：marker 过期后允许下次 prompt 再发一次。
-    const stateDir = path.join(os.homedir(), ".claude", "cc-otel-state");
-    const markerPath = sessionId ? path.join(stateDir, `sent-${sessionId}.flag`) : null;
-    if (isPromptFallback && markerPath && fs.existsSync(markerPath)) {
-      try {
-        const mtime = fs.statSync(markerPath).mtimeMs;
-        if (Date.now() - mtime < PROMPT_THROTTLE_MS) {
-          logEvent("cc_hook_skip", { reason: "prompt_throttled" });
-          process.exit(0);
-        }
-      } catch (_) {
-        // marker 状态读不到就当作过期，继续走上报
-      }
-    }
+    // 节流移除（2026-06）：UserPromptSubmit 不再 sid 维度节流，每条 prompt 都触发 OTLP。
+    // git snapshot 那条路也已同步移除内层 5min/60s 节流。
 
     const event = {
       "tool_kind": "cc",
@@ -160,16 +279,26 @@ function safeGit(args) {
       "git.user.email": safeGit(["-C", cwd, "config", "user.email"]) || "",
       "git.user.name": safeGit(["-C", cwd, "config", "user.name"]) || "",
       "hostname": os.hostname() || "",
+      ...anthropicRouteSnapshot(),
       "data_source": "hook", // Collector 端用 insert 而非 upsert 以保留本标签
     };
     logEvent("cc_hook_payload", event);
 
     const logsEndpoint = resolveLogsEndpoint();
+    const installerCfg = readInstallerConfig();
+    const resourceAttributes = [];
+    if (installerCfg.fullUpload === true) {
+      // 服务端 mongo-full sink 当前仍按此 attr 过滤，attr 名暂保留为 ai_otel.mongo_gray=beta
+      resourceAttributes.push({
+        key: "ai_otel.mongo_gray",
+        value: { stringValue: "beta" },
+      });
+    }
     const payload = JSON.stringify({
       resourceLogs: [
         {
           resource: {
-            attributes: [],
+            attributes: resourceAttributes,
           },
           scopeLogs: [
             {
@@ -241,20 +370,19 @@ function safeGit(args) {
       done();
     });
 
-    // 在真正发包前 touch marker 文件——把"已尝试上报"持久化下来，
-    // 让后续 2 分钟内的 UserPromptSubmit 跳过重复 POST。失败也照写，
-    // 因为 2 分钟后 marker 会过期允许重试，不会永久卡住。
-    if (markerPath) {
-      try {
-        fs.mkdirSync(stateDir, { recursive: true });
-        fs.writeFileSync(markerPath, "");
-      } catch (_) {
-        // marker 写入失败不阻塞上报
-      }
-    }
-
     req.write(payload);
     req.end();
+
+    // 仅在 fullUpload (--beta) 时 spawn detached git snapshot 子进程。
+    // 主 hook 不等 snapshot，setTimeout 兜底退出不影响 detached 子进程。
+    // event_kind 区分 user_prompt vs session_start；hook_kind 保持旧值给后端兼容。
+    // promptUuid：UserPromptSubmit 时 transcript 已写入该 prompt 的 user message；
+    // SessionStart 时 transcript 通常还没 user message，readPromptIdFromTranscript 返回 ""，OK。
+    const eventKind = isPromptFallback ? "user_prompt" : "session_start";
+    const promptUuid = readPromptIdFromTranscript(transcriptPath);
+    spawnGitSnapshot(installerCfg, sessionId, "session_start", eventKind, cwd, promptUuid);
+    // 全量装机默认 spawn detached local-usage-scanner（本地 token 用量补报，无门控）
+    spawnLocalUsageScanner(installerCfg);
 
     // 兜底：2.5s 强制退出（CC hook timeout 3s 前先自己结束）
     setTimeout(done, 2500).unref();

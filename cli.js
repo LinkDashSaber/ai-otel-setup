@@ -22,7 +22,8 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const net = require("net");
-const { execFileSync } = require("child_process");
+const crypto = require("crypto");
+const { execFileSync, spawn, spawnSync } = require("child_process");
 
 const PKG_VERSION = require("./package.json").version;
 
@@ -93,6 +94,9 @@ const HOOK_ID = "team:session-start";
 // UserPromptSubmit 兜底 hook：复用同一脚本，靠 stdin.hook_event_name 分流；
 // 单独 id 是为了让 settings.json 的 SessionStart / UserPromptSubmit 数组各自能按 id 去重
 const PROMPT_HOOK_ID = "team:user-prompt-submit";
+// Stop hook：CC 每轮返回结束触发，灰度场景用来发 git_snapshot session_end；
+// 仍复用 on-session-start.js（按 hook_event_name=Stop 分流），便于幂等去重
+const STOP_HOOK_ID = "team:stop";
 const OTEL_KEYS = [
   "CLAUDE_CODE_ENABLE_TELEMETRY",
   "OTEL_METRICS_EXPORTER",
@@ -164,10 +168,83 @@ function resolveOtelTransport(args) {
   return "http";
 }
 
+function normalizeOptionalUrl(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  return value.replace(/\/+$/, "");
+}
+
+function normalizeOptionalTag(raw) {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  return value;
+}
+
+function deriveRawUploadHost(hostname) {
+  const host = String(hostname || "").replace(/^\[|\]$/g, "");
+  if (!host || isIpHost(host) || isLocalHost(host)) return host;
+  const parts = host.split(".");
+  if (!parts.length) return host;
+  if (parts[0].endsWith("-raw-upload")) {
+    parts[0] = parts[0].replace(/-raw-upload$/, "-upload");
+  } else if (!parts[0].endsWith("-upload")) {
+    parts[0] = `${parts[0]}-upload`;
+  }
+  return parts.join(".");
+}
+
+// local-usage-scanner POST 目标：直接从主 endpoint 派生，独立于 rawUploadUrl
+// （历史上 v1.0.31 用 rawUploadUrl 派生 + 端口 8082，导致没传 mongoGrayTag/upload-token 时
+// rawUploadUrl 为空 → localUsageUrl 也为空 → scanner 静默 skip。v1.0.32 解耦，让全量装机都可用。）
+//
+// 派生规则：
+//   - 域名应用 deriveRawUploadHost 改写（ai-otel.xxx → ai-otel-upload.xxx，与 rawUpload 同 host）
+//   - 非 IP / 非 localhost：清掉端口（走 ingress 默认 443/80，服务端 8090 在 ingress 后面）
+//   - IP / localhost：端口固定 8090（直连 raw-upload-server listener，与生产 ingress 同 port）
+//   - 路径固定 /v1/local-usage
+function deriveLocalUsageUrl(endpoint) {
+  try {
+    const u = new URL(logsEndpointFromGrpc(endpoint));
+    u.hostname = deriveRawUploadHost(u.hostname);
+    if (!isIpHost(u.hostname) && !isLocalHost(u.hostname)) {
+      u.port = "";
+    } else {
+      u.port = "8090";
+    }
+    u.pathname = "/v1/local-usage";
+    u.search = "";
+    u.hash = "";
+    return u.toString().replace(/\/+$/, "");
+  } catch (_) {
+    return "";
+  }
+}
+
+function rawUploadUrlFromEndpoint(endpoint) {
+  try {
+    const logsUrl = new URL(logsEndpointFromGrpc(endpoint));
+    logsUrl.hostname = deriveRawUploadHost(logsUrl.hostname);
+    if (!isIpHost(logsUrl.hostname) && !isLocalHost(logsUrl.hostname)) {
+      logsUrl.port = "";
+    }
+    logsUrl.pathname = "/v1/raw-bodies";
+    logsUrl.search = "";
+    logsUrl.hash = "";
+    return logsUrl.toString().replace(/\/+$/, "");
+  } catch (_) {
+    return "";
+  }
+}
+
 // ---------- url → endpoint ----------
 
 function isIpHost(host) {
   return net.isIP(String(host || "").replace(/^\[|\]$/g, "")) !== 0;
+}
+
+function isLocalHost(host) {
+  const value = String(host || "").replace(/^\[|\]$/g, "").toLowerCase();
+  return value === "localhost" || value === "127.0.0.1" || value === "::1";
 }
 
 function bracketIpv6Host(host) {
@@ -197,9 +274,9 @@ function resolveEndpoint(rawUrl) {
   //   - 域名：生产公网形态，OTLP/gRPC = https://DOMAIN:24317
   // 判断只看地址形态，不写入任何具体 host。
   const url = new URL(`http://${input}`);
-  const isIp = isIpHost(url.hostname);
-  const port = url.port || (isIp ? "4317" : "24317");
-  return formatRootUrl(isIp ? "http:" : "https:", url.hostname, port);
+  const localOrIp = isIpHost(url.hostname) || isLocalHost(url.hostname);
+  const port = url.port || (localOrIp ? "4317" : "24317");
+  return formatRootUrl(localOrIp ? "http:" : "https:", url.hostname, port);
 }
 
 function httpRootEndpointFromLogs(logsEndpoint) {
@@ -517,7 +594,7 @@ function removeSessionSeenMarkers(installDir) {
 
 // ---------- 合并逻辑 ----------
 
-function buildEnv(template, args, endpoint, otelTransport) {
+function buildEnv(template, args, endpoint, otelTransport, rawBodiesDir, fullUpload) {
   const env = { ...template.env };
   if (otelTransport === "http") {
     const logsEndpoint = logsEndpointFromGrpc(endpoint);
@@ -530,11 +607,20 @@ function buildEnv(template, args, endpoint, otelTransport) {
   } else {
     env.OTEL_EXPORTER_OTLP_ENDPOINT = endpoint;
   }
+  // fullUpload (--beta) 时显式打开 3 个隐私 key + 写 RAW_API_BODIES 文件路径；
+  // 非 beta 模式由 settings.template.json 默认值兜底（USER_PROMPTS=0 / TOOL_CONTENT=0 / 不写 RAW_API_BODIES）。
+  // OTEL_KEYS 在 mergeSettings 里走 "has → overwrite，没有 → delete" 语义，所以
+  // 切回非 beta 时上一轮残留的 RAW_API_BODIES 会被自动清掉。
+  if (fullUpload) {
+    env.OTEL_LOG_USER_PROMPTS = "1";
+    env.OTEL_LOG_TOOL_CONTENT = "1";
+    env.OTEL_LOG_RAW_API_BODIES = `file:${rawBodiesDir}`;
+  }
   // OTEL_RESOURCE_ATTRIBUTES 由 mergeSettings 单独处理（parse-merge 用户已有 + 注入 git.user.*）
   return env;
 }
 
-function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, noProxyEntries, gitUser) {
+function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, stopHookEntry, noProxyEntries, gitUser, machineId, fullUpload) {
   const merged = { ...existing };
 
   // env：plugin 优先（组织规范不允许个人改红线），但保留用户独有的 env
@@ -551,6 +637,16 @@ function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, noProxyEntr
     const ra = mergeResourceAttrs(merged.env.OTEL_RESOURCE_ATTRIBUTES, gitUser);
     if (ra) merged.env.OTEL_RESOURCE_ATTRIBUTES = ra;
   }
+  if (machineId) {
+    const attrs = parseResourceAttrs(merged.env.OTEL_RESOURCE_ATTRIBUTES || "");
+    attrs["ai_otel.machine_id"] = machineId;
+    // 全量上报开启：写 ai_otel.mongo_gray=beta（服务端 mongo-full sink 当前
+    // 仍按此 attr 过滤，故 attr 名暂保留；下次发版服务端改完后可一起改名）。
+    // 关闭：显式 delete，让"--beta 重装 → 不 --beta 重装"能彻底卸下。
+    if (fullUpload) attrs["ai_otel.mongo_gray"] = "beta";
+    else delete attrs["ai_otel.mongo_gray"];
+    merged.env.OTEL_RESOURCE_ATTRIBUTES = serializeResourceAttrs(attrs);
+  }
 
   // 兜底用户写坏的 HTTP(S)_PROXY：把 collector host 与 host:port 加进 NO_PROXY，让 OTel gRPC 绕过代理
   // 仅追加，不动用户原有的 NO_PROXY 值，也不动 HTTP_PROXY / HTTPS_PROXY
@@ -561,24 +657,42 @@ function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, noProxyEntr
 
   merged.hooks = { ...(existing.hooks || {}) };
 
+  const isManagedClaudeHook = (h, expectedId) => {
+    if (!h) return false;
+    if (h.id === expectedId) return true;
+    const hooks = Array.isArray(h.hooks) ? h.hooks : [];
+    return hooks.some((item) => {
+      const command = String(item && item.command ? item.command : "");
+      return command.includes("cc-otel") && command.includes("launch-hook.js") && command.includes("on-session-start.js");
+    });
+  };
+
   // hooks.SessionStart：按 id 去重，存在则覆盖，不存在则追加
   const sessionStart = Array.isArray(merged.hooks.SessionStart)
     ? [...merged.hooks.SessionStart]
     : [];
-  const idx = sessionStart.findIndex((h) => h && h.id === HOOK_ID);
-  if (idx >= 0) sessionStart[idx] = hookEntry;
-  else sessionStart.push(hookEntry);
-  merged.hooks.SessionStart = sessionStart;
+  const keptSessionStart = sessionStart.filter((h) => !isManagedClaudeHook(h, HOOK_ID));
+  keptSessionStart.push(hookEntry);
+  merged.hooks.SessionStart = keptSessionStart;
 
   // hooks.UserPromptSubmit：兜底 hook，按 PROMPT_HOOK_ID 去重，规则同上
   if (promptHookEntry) {
     const userPromptSubmit = Array.isArray(merged.hooks.UserPromptSubmit)
       ? [...merged.hooks.UserPromptSubmit]
       : [];
-    const pidx = userPromptSubmit.findIndex((h) => h && h.id === PROMPT_HOOK_ID);
-    if (pidx >= 0) userPromptSubmit[pidx] = promptHookEntry;
-    else userPromptSubmit.push(promptHookEntry);
-    merged.hooks.UserPromptSubmit = userPromptSubmit;
+    const keptUserPromptSubmit = userPromptSubmit.filter((h) => !isManagedClaudeHook(h, PROMPT_HOOK_ID));
+    keptUserPromptSubmit.push(promptHookEntry);
+    merged.hooks.UserPromptSubmit = keptUserPromptSubmit;
+  }
+
+  // hooks.Stop：每轮返回结束触发，灰度发 git_snapshot session_end，按 STOP_HOOK_ID 去重
+  if (stopHookEntry) {
+    const stop = Array.isArray(merged.hooks.Stop)
+      ? [...merged.hooks.Stop]
+      : [];
+    const keptStop = stop.filter((h) => !isManagedClaudeHook(h, STOP_HOOK_ID));
+    keptStop.push(stopHookEntry);
+    merged.hooks.Stop = keptStop;
   }
 
   return merged;
@@ -587,10 +701,10 @@ function mergeSettings(existing, newEnv, hookEntry, promptHookEntry, noProxyEntr
 function logsEndpointFromGrpc(endpoint) {
   try {
     const grpcUrl = new URL(endpoint);
-    const isIp = isIpHost(grpcUrl.hostname);
-    const logsUrl = new URL(`${isIp ? "http:" : "https:"}//${bracketIpv6Host(grpcUrl.hostname)}`);
+    const localOrIp = isIpHost(grpcUrl.hostname) || isLocalHost(grpcUrl.hostname);
+    const logsUrl = new URL(`${localOrIp ? "http:" : "https:"}//${bracketIpv6Host(grpcUrl.hostname)}`);
 
-    if (isIp) {
+    if (localOrIp) {
       logsUrl.port = !grpcUrl.port || grpcUrl.port === "4317" ? "4318" : grpcUrl.port;
     } else if (grpcUrl.port && grpcUrl.port !== "24317") {
       logsUrl.port = grpcUrl.port;
@@ -613,6 +727,379 @@ function buildEndpointConfig(endpoint, otelTransport) {
     installerVersion: PKG_VERSION,
     packageName: "ai-otel-setup",
   };
+}
+
+function getOrCreateMachineId(installDir) {
+  const p = path.join(installDir, "machine-id");
+  try {
+    if (fs.existsSync(p)) {
+      const existing = fs.readFileSync(p, "utf8").trim();
+      if (existing) return existing;
+    }
+  } catch (_) {
+    // Regenerate below.
+  }
+  const id = crypto.randomUUID();
+  fs.mkdirSync(installDir, { recursive: true });
+  fs.writeFileSync(p, id + "\n", { mode: 0o600 });
+  return id;
+}
+
+function buildFullEndpointConfig(endpoint, otelTransport, extra = {}) {
+  return {
+    ...buildEndpointConfig(endpoint, otelTransport),
+    ...extra,
+  };
+}
+
+function installRawUploader(installDir, uploadToken) {
+  const uploaderDir = path.join(installDir, "raw-uploader");
+  fs.mkdirSync(uploaderDir, { recursive: true });
+  const uploaderDest = path.join(installDir, "raw-body-uploader.js");
+  fs.copyFileSync(path.join(__dirname, "templates", "raw-body-uploader.js"), uploaderDest);
+  fs.chmodSync(uploaderDest, 0o755);
+  const tokenPath = path.join(installDir, "raw-upload-token");
+  if (uploadToken) {
+    fs.writeFileSync(tokenPath, String(uploadToken).trim() + "\n", { mode: 0o600 });
+  } else if (fs.existsSync(tokenPath)) {
+    fs.unlinkSync(tokenPath);
+  }
+}
+
+function launchctlPath() {
+  try {
+    return execFileSync("/usr/bin/which", ["launchctl"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1000,
+    }).trim();
+  } catch (_) {
+    return "";
+  }
+}
+
+function installMacRawUploaderTimer(installDir) {
+  if (process.platform !== "darwin") return { status: "skipped" };
+  const launchctl = launchctlPath();
+  if (!launchctl) return { status: "skipped", reason: "launchctl not found" };
+  const agentsDir = path.join(os.homedir(), "Library", "LaunchAgents");
+  fs.mkdirSync(agentsDir, { recursive: true });
+  const plistPath = path.join(agentsDir, "com.ai-otel.raw-uploader.plist");
+  const uploaderPath = path.join(installDir, "raw-body-uploader.js");
+  const plist = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ai-otel.raw-uploader</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${escapeXml(NODE_BIN)}</string>
+    <string>${escapeXml(uploaderPath)}</string>
+    <string>--once</string>
+    <string>--max-runtime=25</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>60</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${escapeXml(path.join(installDir, "raw-uploader.out.log"))}</string>
+  <key>StandardErrorPath</key>
+  <string>${escapeXml(path.join(installDir, "raw-uploader.err.log"))}</string>
+</dict>
+</plist>
+`;
+  fs.writeFileSync(plistPath, plist, "utf8");
+  try {
+    spawnSync(launchctl, ["unload", plistPath], {
+      stdio: "ignore",
+      timeout: 3000,
+    });
+  } catch (_) {}
+  const r = spawnSync(launchctl, ["load", plistPath], {
+    stdio: "ignore",
+    timeout: 3000,
+  });
+  return {
+    status: r.status === 0 ? "installed" : "written",
+    path: plistPath,
+  };
+}
+
+function systemdQuoteArg(arg) {
+  return `"${String(arg).replace(/(["\\$`])/g, "\\$1")}"`;
+}
+
+function installLinuxRawUploaderTimer(installDir) {
+  if (process.platform !== "linux") return { status: "skipped" };
+  const systemctl = (() => {
+    try {
+      return execFileSync("/usr/bin/which", ["systemctl"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1000,
+      }).trim();
+    } catch (_) {
+      return "";
+    }
+  })();
+
+  const uploaderPath = path.join(installDir, "raw-body-uploader.js");
+  const unitName = "ai-otel-raw-uploader";
+  const userSystemdDir = path.join(os.homedir(), ".config", "systemd", "user");
+  const servicePath = path.join(userSystemdDir, `${unitName}.service`);
+  const timerPath = path.join(userSystemdDir, `${unitName}.timer`);
+
+  if (systemctl) {
+    fs.mkdirSync(userSystemdDir, { recursive: true });
+    const service = `[Unit]
+Description=AI OTEL raw body uploader
+
+[Service]
+Type=oneshot
+ExecStart=${systemdQuoteArg(NODE_BIN)} ${systemdQuoteArg(uploaderPath)} --once --max-runtime=25
+`;
+    const timer = `[Unit]
+Description=Run AI OTEL raw body uploader every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+Unit=${unitName}.service
+
+[Install]
+WantedBy=timers.target
+`;
+    fs.writeFileSync(servicePath, service, "utf8");
+    fs.writeFileSync(timerPath, timer, "utf8");
+
+    try {
+      spawnSync(systemctl, ["--user", "daemon-reload"], { stdio: "ignore", timeout: 5000 });
+      spawnSync(systemctl, ["--user", "enable", "--now", `${unitName}.timer`], {
+        stdio: "ignore",
+        timeout: 8000,
+      });
+      return { status: "installed", path: timerPath };
+    } catch (_) {
+      // Fall through to crontab fallback below.
+    }
+  }
+
+  const crontab = (() => {
+    try {
+      return execFileSync("/usr/bin/which", ["crontab"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1000,
+      }).trim();
+    } catch (_) {
+      return "";
+    }
+  })();
+  if (!crontab) return { status: "written", reason: "systemctl/crontab not found" };
+
+  const cronMarker = "# ai-otel-raw-uploader";
+  const cronLine = `* * * * * ${systemdQuoteArg(NODE_BIN)} ${systemdQuoteArg(uploaderPath)} --once --max-runtime=25 >/dev/null 2>&1 ${cronMarker}`;
+  let existing = "";
+  try {
+    existing = execFileSync(crontab, ["-l"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 3000,
+    });
+  } catch (_) {
+    existing = "";
+  }
+  const lines = existing
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter((line) => line && !line.includes(cronMarker));
+  lines.push(cronLine);
+  const payload = lines.join("\n") + "\n";
+  const r = spawnSync(crontab, ["-"], {
+    input: payload,
+    encoding: "utf8",
+    stdio: ["pipe", "ignore", "ignore"],
+    timeout: 5000,
+  });
+  return {
+    status: r.status === 0 ? "installed" : "written",
+    path: "crontab",
+  };
+}
+
+function installWindowsRawUploaderTimer(installDir) {
+  if (process.platform !== "win32") return { status: "skipped" };
+  const schtasks = (() => {
+    try {
+      return execFileSync("where", ["schtasks"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        shell: true,
+        timeout: 1000,
+        windowsHide: true,
+      })
+        .split(/\r?\n/)[0]
+        .trim();
+    } catch (_) {
+      return "schtasks";
+    }
+  })();
+  const taskName = "ai-otel-raw-uploader";
+  const uploaderPath = path.join(installDir, "raw-body-uploader.js").replace(/\\/g, "/");
+  const nodePath = NODE_BIN.replace(/\\/g, "/");
+  const taskCommand = `"${nodePath}" "${uploaderPath}" --once --max-runtime=25`;
+
+  try {
+    spawnSync(schtasks, ["/Delete", "/F", "/TN", taskName], {
+      stdio: "ignore",
+      shell: true,
+      timeout: 5000,
+      windowsHide: true,
+    });
+  } catch (_) {}
+
+  const r = spawnSync(
+    schtasks,
+    ["/Create", "/F", "/SC", "MINUTE", "/MO", "1", "/TN", taskName, "/TR", taskCommand],
+    {
+      stdio: "ignore",
+      shell: true,
+      timeout: 8000,
+      windowsHide: true,
+    }
+  );
+  return {
+    status: r.status === 0 ? "installed" : "written",
+    path: taskName,
+  };
+}
+
+function installRawUploaderTimer(installDir) {
+  if (process.platform === "darwin") return installMacRawUploaderTimer(installDir);
+  if (process.platform === "linux") return installLinuxRawUploaderTimer(installDir);
+  if (process.platform === "win32") return installWindowsRawUploaderTimer(installDir);
+  return { status: "skipped" };
+}
+
+// 卸载之前装机留下的 raw-uploader timer。三种触发场景共用：
+//   1. 非 --beta 装机：每次都跑一次 uninstall，把残留干掉（幂等，没残留就 no-op）
+//   2. 重装 --beta 装机：install 之前先 uninstall（旧的 plist/unit 内容可能旧版本，刷新）
+//   3. （未来）显式 cleanup 子命令
+// 失败不抛错，最差就是 launchd/systemd/schtasks 里残一份；状态字段给主流程拿来打日志。
+function uninstallMacRawUploaderTimer() {
+  if (process.platform !== "darwin") return { status: "skipped" };
+  const launchctl = launchctlPath();
+  const plistPath = path.join(os.homedir(), "Library", "LaunchAgents", "com.ai-otel.raw-uploader.plist");
+  if (!fs.existsSync(plistPath) && !launchctl) return { status: "noop" };
+  if (launchctl && fs.existsSync(plistPath)) {
+    try {
+      spawnSync(launchctl, ["unload", plistPath], { stdio: "ignore", timeout: 3000 });
+    } catch (_) {}
+  }
+  try { if (fs.existsSync(plistPath)) fs.unlinkSync(plistPath); } catch (_) {}
+  return { status: "removed", path: plistPath };
+}
+
+function uninstallLinuxRawUploaderTimer() {
+  if (process.platform !== "linux") return { status: "skipped" };
+  const unitName = "ai-otel-raw-uploader";
+  const userSystemdDir = path.join(os.homedir(), ".config", "systemd", "user");
+  const servicePath = path.join(userSystemdDir, `${unitName}.service`);
+  const timerPath = path.join(userSystemdDir, `${unitName}.timer`);
+  const systemctl = (() => {
+    try {
+      return execFileSync("/usr/bin/which", ["systemctl"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1000,
+      }).trim();
+    } catch (_) { return ""; }
+  })();
+  if (systemctl) {
+    try {
+      spawnSync(systemctl, ["--user", "disable", "--now", `${unitName}.timer`], { stdio: "ignore", timeout: 5000 });
+    } catch (_) {}
+    try { spawnSync(systemctl, ["--user", "daemon-reload"], { stdio: "ignore", timeout: 5000 }); } catch (_) {}
+  }
+  try { if (fs.existsSync(timerPath)) fs.unlinkSync(timerPath); } catch (_) {}
+  try { if (fs.existsSync(servicePath)) fs.unlinkSync(servicePath); } catch (_) {}
+
+  // crontab 兜底：删带 marker 的行
+  const crontab = (() => {
+    try {
+      return execFileSync("/usr/bin/which", ["crontab"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1000,
+      }).trim();
+    } catch (_) { return ""; }
+  })();
+  if (crontab) {
+    let existing = "";
+    try {
+      existing = execFileSync(crontab, ["-l"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 3000,
+      });
+    } catch (_) {}
+    const cronMarker = "# ai-otel-raw-uploader";
+    if (existing.includes(cronMarker)) {
+      const lines = existing.split(/\r?\n/).map((l) => l.trimEnd()).filter((l) => l && !l.includes(cronMarker));
+      const payload = lines.length ? lines.join("\n") + "\n" : "";
+      try {
+        spawnSync(crontab, ["-"], {
+          input: payload,
+          encoding: "utf8",
+          stdio: ["pipe", "ignore", "ignore"],
+          timeout: 5000,
+        });
+      } catch (_) {}
+    }
+  }
+  return { status: "removed" };
+}
+
+function uninstallWindowsRawUploaderTimer() {
+  if (process.platform !== "win32") return { status: "skipped" };
+  const schtasks = (() => {
+    try {
+      return execFileSync("where", ["schtasks"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        shell: true,
+        timeout: 1000,
+        windowsHide: true,
+      }).split(/\r?\n/)[0].trim();
+    } catch (_) { return "schtasks"; }
+  })();
+  try {
+    spawnSync(schtasks, ["/Delete", "/F", "/TN", "ai-otel-raw-uploader"], {
+      stdio: "ignore",
+      shell: true,
+      timeout: 5000,
+      windowsHide: true,
+    });
+  } catch (_) {}
+  return { status: "removed" };
+}
+
+function uninstallRawUploaderTimer() {
+  if (process.platform === "darwin") return uninstallMacRawUploaderTimer();
+  if (process.platform === "linux") return uninstallLinuxRawUploaderTimer();
+  if (process.platform === "win32") return uninstallWindowsRawUploaderTimer();
+  return { status: "skipped" };
+}
+
+function escapeXml(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 // ---------- Codex config.toml 处理 ----------
@@ -835,9 +1322,62 @@ function installGemini(home, endpoint, otelTransport) {
   return { tool: "gemini", status: "installed", path: settingsPath, backup: bak };
 }
 
+// ---------- 子命令分发 ----------
+
+// `npx -y ai-otel-setup usage-backfill [...]`：调用已安装的本地用量 scanner
+// （manual mode），透传给用户加的 --window=N / --dry-run / --force 等开关。
+// 用户必须先正常装机（生成 endpoint.json 和 scanner 文件）才能用这个命令。
+function runUsageBackfillCommand(extraArgs) {
+  const installDir = path.join(os.homedir(), ".claude", "cc-otel");
+  const scannerPath = path.join(installDir, "local-usage-scanner.js");
+  const endpointPath = path.join(installDir, "endpoint.json");
+
+  if (!fs.existsSync(scannerPath) || !fs.existsSync(endpointPath)) {
+    console.error("[ai-otel-setup] 未检测到 " + installDir + "/，请先正常装机一次：");
+    console.error("  npx -y ai-otel-setup url=团队上报地址");
+    process.exit(1);
+  }
+
+  const scannerArgs = ["--manual"];
+  for (const a of extraArgs) {
+    if (a === "--help" || a === "-h") {
+      console.log("Usage: npx -y ai-otel-setup usage-backfill [选项]");
+      console.log("");
+      console.log("从本地 jsonl 重新聚合最近的 token 用量并 POST 到团队上报。");
+      console.log("默认走 7 天窗口、5 分钟节流、历史天 lock；用下面的开关可放宽。");
+      console.log("");
+      console.log("  --window=N         扫描近 N 天（默认 7，上限 30）");
+      console.log("  --dry-run          算 buckets 不发送，只 print 统计");
+      console.log("  --force            等于 --ignore-throttle --ignore-lock");
+      console.log("  --ignore-throttle  跳过 5 分钟节流");
+      console.log("  --ignore-lock      跳过历史天 lock，强制重扫");
+      return;
+    }
+    if (a === "--dry-run" || a === "--ignore-throttle" || a === "--ignore-lock" || a === "--force") {
+      scannerArgs.push(a);
+    } else if (/^--window=\d+$/.test(a)) {
+      scannerArgs.push(a);
+    } else {
+      console.error("[ai-otel-setup] usage-backfill: 未识别参数 " + JSON.stringify(a));
+      console.error("  执行 `npx -y ai-otel-setup usage-backfill --help` 查看可用开关。");
+      process.exit(2);
+    }
+  }
+
+  const result = spawnSync(process.execPath, [scannerPath, ...scannerArgs], {
+    stdio: "inherit",
+  });
+  process.exit(result.status === null ? 1 : result.status);
+}
+
 // ---------- 主流程 ----------
 
 async function main() {
+  // 子命令：positional `usage-backfill` 走独立分发，不进装机流程
+  if (process.argv[2] === "usage-backfill") {
+    return runUsageBackfillCommand(process.argv.slice(3));
+  }
+
   const args = parseArgs(process.argv.slice(2));
 
   if (args.help || args.h || process.argv.includes("--help")) {
@@ -879,7 +1419,24 @@ async function main() {
 
   const endpoint = resolveEndpoint(args.url);
   const otelTransport = resolveOtelTransport(args);
-  const newEnv = buildEnv(settingsTemplate, args, endpoint, otelTransport);
+  const machineId = getOrCreateMachineId(installDir);
+  const rawBodiesDir = path.join(installDir, "raw-bodies");
+  const rawUploadToken = args["upload-token"] || args.uploadtoken || "";
+  // 全量数据上报开关（替代旧的 mongo-gray=beta 概念）。
+  // 当前灰度阶段：默认 false；--beta（或 full-upload=true）显式开。
+  // 下次发版（灰度结束）时把默认翻转成 true，opt-out 改 --no-full-upload。
+  const fullUpload = truthyFlag(args.beta) || truthyFlag(args["full-upload"]);
+  const explicitRawUploadUrl = normalizeOptionalUrl(args["upload-url"] || args.uploadurl);
+  // rawUploadUrl 唯一来源：fullUpload（--beta）；显式 --upload-url 仍可强制覆盖。
+  // 非 beta 用户不需要这个 URL，scanner/raw-body-uploader 都不会跑。
+  const rawUploadUrl = explicitRawUploadUrl || (fullUpload ? rawUploadUrlFromEndpoint(endpoint) : "");
+  // raw-bodies 目录只在 fullUpload 时建（CC 才会写盘 raw API body）；
+  // 非 beta 用户曾经装过 beta 的话，目录里残留文件保留，由用户手动清。
+  if (fullUpload) {
+    fs.mkdirSync(rawBodiesDir, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(rawBodiesDir, 0o700); } catch (_) {}
+  }
+  const newEnv = buildEnv(settingsTemplate, args, endpoint, otelTransport, rawBodiesDir, fullUpload);
 
   const hookEntry = {
     matcher: "*",
@@ -912,17 +1469,67 @@ async function main() {
     id: PROMPT_HOOK_ID,
   };
 
+  // Stop hook：复用 on-session-start.js（按 hook_event_name=Stop 在脚本内分流）。
+  // 仅在 fullUpload (--beta) 时实际触发 git snapshot；非全量场景脚本会立即 noop 退出。
+  const stopHookEntry = {
+    matcher: "*",
+    hooks: [
+      {
+        type: "command",
+        command: buildHookCommand(launcherDest, hookScriptDest),
+        timeout: 3,
+      },
+    ],
+    description:
+      "ai-otel-setup 注入：Stop 触发 git snapshot（仅 --beta 全量上报时启用）",
+    id: STOP_HOOK_ID,
+  };
+
   fs.mkdirSync(installDir, { recursive: true });
   fs.copyFileSync(hookScriptSrc, hookScriptDest);
   fs.chmodSync(hookScriptDest, 0o755);
   installLauncher(installDir);
+  // git-snapshot.js：on-session-start.js spawn 出来的 detached 子进程脚本
+  const gitSnapshotDest = path.join(installDir, "git-snapshot.js");
+  fs.copyFileSync(path.join(templateDir, "git-snapshot.js"), gitSnapshotDest);
+  fs.chmodSync(gitSnapshotDest, 0o755);
+  // local-usage-scanner.js：同样由 on-session-start.js spawn 出来的 detached 子进程
+  const localUsageScannerDest = path.join(installDir, "local-usage-scanner.js");
+  fs.copyFileSync(path.join(templateDir, "local-usage-scanner.js"), localUsageScannerDest);
+  fs.chmodSync(localUsageScannerDest, 0o755);
+  // installRawUploader 同时管 raw-body-uploader.js 脚本 + raw-upload-token 文件：
+  //   - fullUpload=true：写 token（如果用户传了 --upload-token）
+  //   - fullUpload=false：传空 token 让它把残留 token 删干净
+  installRawUploader(installDir, fullUpload ? rawUploadToken : "");
+  // Timer 生命周期：先无脑 uninstall 一次（幂等，对没装过的也是 no-op），
+  // 再按 fullUpload 决定要不要 install。这样 true → false 重装能自动卸 timer。
+  uninstallRawUploaderTimer();
+  const rawUploaderTimer = fullUpload ? installRawUploaderTimer(installDir) : { status: "skipped" };
   writeInstallLog(installDir, "claude", endpoint, otelTransport);
 
   // v1.0.3：把 endpoint 写盘，给 hook 脚本的 resolveLogsEndpoint 当兜底。
   // 修的是 v1.0.2 的真实事故：settings.json 的 env 不一定能继承到 hook 子进程
   // （Windows / 已运行的 CC 实例都会踩到），导致 hook fallback 到 localhost
   // 拿 ECONNREFUSED 静默失败、marker 已写但 POST 永不到达。
-  writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint, otelTransport));
+  writeJSONAtomic(
+    path.join(installDir, "endpoint.json"),
+    buildFullEndpointConfig(endpoint, otelTransport, {
+      machineId,
+      rawBodiesDir,
+      rawUploadUrl,
+      rawUploadChunkBytes: 4 * 1024 * 1024,
+      hasUploadToken: !!rawUploadToken,
+      fullUpload,
+      gitUserEmail: gitUser.email,
+      // git-snapshot.js 读这三个字段做三轴截断；默认值在 snapshot 脚本内兜底
+      gitSnapshotMaxFiles: 20,
+      gitSnapshotMaxBytes: 1 * 1024 * 1024,
+      gitSnapshotPerFileBytes: 256 * 1024,
+      // local-usage-scanner.js 读这个 URL 上报本地用量；从主 endpoint 独立派生
+      // （与 rawUploadUrl 同 hostname，不受 fullUpload / upload-token 门控）
+      localUsageUrl: deriveLocalUsageUrl(endpoint),
+    })
+  );
 
   const existing = readJSONSafe(settingsPath);
   const bak = backup(settingsPath);
@@ -931,8 +1538,11 @@ async function main() {
     newEnv,
     hookEntry,
     promptHookEntry,
+    stopHookEntry,
     buildNoProxyEntries(endpoint, otelTransport),
-    gitUser
+    gitUser,
+    machineId,
+    fullUpload
   );
   writeJSONAtomic(settingsPath, merged);
 
@@ -961,12 +1571,40 @@ async function main() {
     console.log(`  ${r.tool.padEnd(12)}: ${r.status}${r.reason ? " (" + r.reason + ")" : ""}`);
   }
   if (debug) {
+    console.log(`  ${"raw bodies".padEnd(12)}: ${rawBodiesDir}`);
+    console.log(`  ${"raw upload".padEnd(12)}: ${rawUploadUrl ? "enabled" : "disabled"}`);
+    if (rawUploadUrl) {
+      const timerDetail = rawUploaderTimer.path ? ` (${rawUploaderTimer.path})` : rawUploaderTimer.reason ? ` (${rawUploaderTimer.reason})` : "";
+      console.log(`  ${"raw timer".padEnd(12)}: ${rawUploaderTimer.status}${timerDetail}`);
+    }
+    if (fullUpload) console.log(`  ${"mode".padEnd(12)}: beta (full upload)`);
+    console.log(`  ${"usage url".padEnd(12)}: ${deriveLocalUsageUrl(endpoint) || "(empty)"}`);
     console.log(`  ${"hook script".padEnd(12)}: ${hookScriptDest}`);
     console.log(`  ${"settings".padEnd(12)}: ${settingsPath}`);
     if (bak) console.log(`  ${"backup".padEnd(12)}: ${bak}`);
   }
   console.log("");
   console.log("接下来：直接运行 `claude` / `codex` / `gemini`，下次会话启动即自动上报。");
+
+  // 装完立刻在后台 spawn 一次本地用量补报（detached + stdio:ignore + windowsHide），
+  // 让用户当天就能在看板看到数据，不必等首次 SessionStart。--ignore-throttle/lock
+  // 避免被刚装机时的旧 marker 卡住；走默认 7 天窗口，重度回补让用户自己跑
+  // `npx -y ai-otel-setup usage-backfill --window=30 --force`。
+  try {
+    const scannerPath = path.join(installDir, "local-usage-scanner.js");
+    if (fs.existsSync(scannerPath)) {
+      const child = spawn(process.execPath, [scannerPath, "--ignore-throttle", "--ignore-lock"], {
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+      });
+      child.unref();
+      console.log("已在后台触发首次本地用量补报，扫近 7 天 jsonl；日志见 ~/.claude/cc-otel/ai-otel.log。");
+    }
+  } catch (_) {
+    // 补报失败不阻塞装机；用户后续可手动 `npx -y ai-otel-setup usage-backfill`
+  }
+
   if (debug) {
     console.log(
       "卸载：删除 " +
@@ -974,7 +1612,8 @@ async function main() {
         " 与 " +
         path.join(claudeDir, "cc-otel-state") +
         "（marker 目录），并从 settings.json 移除 12 个 OTEL_* env、" +
-        "SessionStart 中 id=" + HOOK_ID + " 与 UserPromptSubmit 中 id=" + PROMPT_HOOK_ID + " 的条目。"
+        "SessionStart 中 id=" + HOOK_ID + "、UserPromptSubmit 中 id=" + PROMPT_HOOK_ID +
+        "、Stop 中 id=" + STOP_HOOK_ID + " 的条目。"
     );
   }
 
@@ -992,6 +1631,9 @@ function printUsage() {
 可选：
   --http | http=1    Claude Code 原生 OTel 使用 OTLP/HTTP（默认）
   --grpc | grpc=1    Claude Code 原生 OTel 强制使用 gRPC（fallback）
+  --beta             开启全量数据上报旁路（raw body + git snapshot），灰度阶段须显式传入
+  upload-url=URL     raw body 上传入口，例如 https://host/v1/raw-bodies；灰度安装时不传会按 url 自动推导 raw-upload 域名
+  upload-token=TOKEN raw body 上传 Bearer token（可选；仅服务端开启鉴权时需要，传入时写入本地 0600 token 文件）
   debug=1 | --debug   显示安装路径、备份路径与卸载提示
 `);
 }

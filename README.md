@@ -53,6 +53,18 @@ npx -y ai-otel-setup url=collector服务地址
 | 会采集 | 调用了哪些工具、每次耗时、是否成功、Token 用量、当前目录、Git 信息 |
 | 不采集 | 你输入的提示词、代码正文、工具入参、API 原始内容 |
 
+## 本地用量补报
+
+补全 Claude Code 原生 OTel 偶尔漏报的 token 数据。装完会立即在后台跑一次首发补报。
+
+手动立刻触发一次补报：
+
+```bash
+npx -y ai-otel-setup usage-backfill
+```
+
+完整说明（参数表、输出怎么读、排查）见 [docs/usage-backfill.md](docs/usage-backfill.md)。
+
 ## 本地日志
 
 安装后会在本机写入排查日志，只保留最近 3 天数据：
@@ -71,6 +83,25 @@ npx -y ai-otel-setup url=collector服务地址
 ls ~/.claude/settings.json.bak.* | tail -1 | xargs -I{} cp {} ~/.claude/settings.json
 rm -rf ~/.claude/cc-otel
 ```
+
+如果你装过 `--beta`，系统级 raw body 上传 timer 也要清掉：
+
+```bash
+# macOS
+launchctl unload ~/Library/LaunchAgents/com.ai-otel.raw-uploader.plist
+rm -f ~/Library/LaunchAgents/com.ai-otel.raw-uploader.plist
+
+# Linux (systemd 用户态)
+systemctl --user disable --now ai-otel-raw-uploader.timer
+rm -f ~/.config/systemd/user/ai-otel-raw-uploader.{service,timer}
+
+# Windows
+schtasks /Delete /F /TN ai-otel-raw-uploader
+```
+
+> 提示：不想卸载、只想关掉 raw body 上报？直接**重跑安装命令不加 `--beta`**，
+> installer 会自动 uninstall timer + 把 settings.json 里的隐私 env（USER_PROMPTS / TOOL_CONTENT / RAW_API_BODIES）改回 0/删除。`~/.claude/cc-otel/raw-bodies/` 目录里
+> 残留的 body 文件不会被自动清理，可以放心手动删。
 
 ## 排查
 
