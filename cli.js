@@ -445,7 +445,7 @@ function postJsonWithTimeout(targetUrl, payload, timeoutMs) {
   });
 }
 
-async function reportInstall(otelEndpoint, gitUser, allResults, debug) {
+async function reportInstall(otelEndpoint, gitUser, allResults, debug, fullUpload) {
   if (!gitUser || !gitUser.email) {
     if (debug) console.error("[ai-otel-setup] 跳过装机上报：无 git user.email");
     return;
@@ -474,6 +474,7 @@ async function reportInstall(otelEndpoint, gitUser, allResults, debug) {
     "node_version": process.version,
     "cc_cli_detected": findOk("claude") ? "1" : "0",
     "codex_cli_detected": findOk("codex") ? "1" : "0",
+    "full_upload": fullUpload ? "1" : "0",
   };
   const payload = {
     resourceLogs: [
@@ -1124,9 +1125,10 @@ function escapeXml(s) {
 //   type = "command"
 //   command = "..."
 //
-// 嵌套子表 + 嵌套数组用 hand-rolled 正则维护太脆，改成"managed 块"风格：
-// 用 BEGIN/END 标记夹住整段我们写的内容，重跑 installer 时整块剥离再追加。
-
+// 重跑 installer 时按【内容键控】清理我方写入：otel 走 stripCodexOtel（整个 [otel]
+// 命名空间），hook 走 stripAiOtelSessionStartHooks（命令签名）。不再依赖 BEGIN/END
+// 注释标记——codex 重写 config.toml 时会丢注释、抹掉 marker，标记块会被孤立成残留。
+// 下面两个常量仅供 stripCodexManagedBlock 迁移老用户的旧 marker 块用，新写入不再产生。
 const CODEX_MANAGED_BEGIN = "# >>> ai-otel-setup managed >>>";
 const CODEX_MANAGED_END = "# <<< ai-otel-setup managed <<<";
 
@@ -1166,11 +1168,14 @@ function stripAiOtelSessionStartHooks(text) {
   );
 }
 
-function stripLegacyCodexOtel(text) {
-  // 旧 installer 写的 [otel]（含非法 key enabled = true）整段删除，避免与新 [otel] 冲突
+function stripCodexOtel(text) {
+  // 删除任意 [otel] 及其所有 [otel.*] 子表（不再只删带 enabled=true 的旧块）。
+  // 我们每次都重写整个 otel 命名空间，先全清再写 → 永不出现重复 [otel]
+  // （TOML 1.0 禁止同名表重复声明，重复会让 codex 启动直接解析失败——已有用户反馈）。
+  // 逐个表头匹配 [otel] / [otel.xxx]，body 吃到下一个表头（行首 [）或 EOF。
   return text.replace(
-    /(?:\n|^)\[otel\][\s\S]*?(?=\n\[|\n\[\[|$)/g,
-    (m) => (/enabled\s*=\s*true/.test(m) ? "" : m)
+    /(?:^|\n)\[otel(?:\.[^\]\n]*)?\][^\n]*(?:\n(?!\s*\[)[^\n]*)*/g,
+    ""
   );
 }
 
@@ -1248,10 +1253,11 @@ function buildCodexOtelBlock(endpoint, otelTransport) {
   ];
 }
 
-function buildCodexManagedBlock(endpoint, hookDest, launcherDest, otelTransport) {
+function buildCodexOtelHookBlock(endpoint, hookDest, launcherDest, otelTransport) {
+  // 不再包裹 BEGIN/END 注释标记：codex 重写 config.toml 时会丢注释、把 marker 抹掉，
+  // 标记本就靠不住。改为纯内容键控——重跑时按 otel 命名空间 + hook 命令签名识别并清理。
   // [features].hooks = true 由 ensureFeaturesHooksTrue 写到用户块里，避免重复声明 [features]
   return [
-    CODEX_MANAGED_BEGIN,
     "[otel]",
     'environment = "prod"',
     "log_user_prompt = false",
@@ -1264,7 +1270,6 @@ function buildCodexManagedBlock(endpoint, hookDest, launcherDest, otelTransport)
     "[[hooks.SessionStart.hooks]]",
     'type = "command"',
     `command = ${JSON.stringify(buildHookCommand(launcherDest, hookDest))}`,
-    CODEX_MANAGED_END,
   ].join("\n");
 }
 
@@ -1295,10 +1300,11 @@ function installCodex(home, endpoint, otelTransport) {
   const { text: withoutState, state: hooksState } = extractHooksState(existing);
   existing = withoutState;
 
-  // 先剥离上一次的 managed 块和旧 schema 残留，再保证用户块里有 hooks = true
+  // 先剥离我们上次写的内容和旧 schema 残留，再保证用户块里有 hooks = true。
+  // stripCodexManagedBlock 仍保留：迁移老用户残留的 BEGIN/END marker 块，无标记时是 no-op。
   existing = stripCodexManagedBlock(existing);
-  existing = stripAiOtelSessionStartHooks(existing); // F2：删 marker 外的 ai-otel SessionStart 重复
-  existing = stripLegacyCodexOtel(existing);
+  existing = stripAiOtelSessionStartHooks(existing); // F2：按命令签名删 ai-otel SessionStart（含 codex 规范化搬走的）
+  existing = stripCodexOtel(existing);               // 删整个 [otel] 命名空间，避免重复声明
   existing = stripLegacyCodexHook(existing);
   existing = stripLegacyCodexHooksFlag(existing);
   existing = ensureFeaturesHooksTrue(existing);
@@ -1311,9 +1317,9 @@ function installCodex(home, endpoint, otelTransport) {
     machineId,
     localUsageUrl: deriveLocalUsageUrl(endpoint),
   });
-  const managed = buildCodexManagedBlock(endpoint, hookDest, launcherDest, otelTransport);
-  // F1：信任库放回末尾（managed marker 外），下次 strip 不会再误删；命令未变 → trusted_hash 仍匹配 → hook 持续受信。
-  let merged = existing.trimEnd() + "\n\n" + managed + "\n";
+  const otelHook = buildCodexOtelHookBlock(endpoint, hookDest, launcherDest, otelTransport);
+  // F1：信任库放回末尾（我方写入块之外），下次 strip 不会再误删；命令未变 → trusted_hash 仍匹配 → hook 持续受信。
+  let merged = existing.trimEnd() + "\n\n" + otelHook + "\n";
   if (hooksState) merged += "\n" + hooksState + "\n";
   merged = merged.replace(/\n{3,}/g, "\n\n");
   fs.writeFileSync(configPath, merged, "utf8");
@@ -1662,7 +1668,7 @@ async function main() {
   }
 
   // 装机上报：fire-and-forget 语义，3s 内完成或放弃；任何错误都不冒泡
-  await reportInstall(endpoint, gitUser, allResults, debug);
+  await reportInstall(endpoint, gitUser, allResults, debug, fullUpload);
 }
 
 function printUsage() {
