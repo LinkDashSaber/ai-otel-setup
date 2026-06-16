@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 
-const { execFileSync } = require("child_process");
+const { execFileSync, spawn } = require("child_process");
 const os = require("os");
 const path = require("path");
 const fs = require("fs");
@@ -46,6 +46,23 @@ function endpoint() {
   return "http://localhost:4318/v1/logs";
 }
 
+// 每次 codex SessionStart 都 spawn detached 的本地用量扫描器，让 codex 用户（往往不开 Claude Code）
+// 不再只有装机那一次上报。读 endpoint.json 的 localUsageUrl 决定是否启用；节流由 scanner 自身 5min 控制。
+// 这里用 process.execPath 没问题：hook 已经在 node 里跑，不涉及外层命令的 node 路径解析问题。
+function spawnLocalUsageScanner() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, "endpoint.json"), "utf8"));
+    if (!cfg || !cfg.localUsageUrl) return;
+    const scannerPath = path.join(__dirname, "local-usage-scanner.js");
+    if (!fs.existsSync(scannerPath)) return;
+    const child = spawn(process.execPath, [scannerPath], { detached: true, stdio: "ignore", windowsHide: true });
+    child.unref();
+    logEvent("codex_local_usage_spawned", {});
+  } catch (e) {
+    logEvent("codex_local_usage_spawn_failed", { error: (e && e.message) || "unknown" });
+  }
+}
+
 (async () => {
   try {
     const raw = await readStdin();
@@ -54,6 +71,7 @@ function endpoint() {
     const conversation = input.conversation || {};
     const sid = conversation.id || input.conversation_id || input.session_id || "";
     logEvent("codex_hook_start", { hasSessionId: !!sid });
+    spawnLocalUsageScanner();
 
     const cwd = input.cwd || process.cwd();
     const event = {

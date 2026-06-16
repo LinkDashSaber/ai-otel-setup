@@ -1141,6 +1141,30 @@ function stripCodexManagedBlock(text) {
   return text.replace(re, "\n");
 }
 
+// F1：把 [hooks.state] 整段（含点号子表 [hooks.state."..."]）抽出、从正文移除并返回，
+// 供 strip 之后原样放回（marker 外）。codex 把信任哈希序列化进 managed 块内时，
+// stripCodexManagedBlock 会连它一起删 → hook 失信。[hooks.state] 是普通表，
+// 边界 = 从 [hooks.state] 起，到下一个【非 hooks.state】顶层表（含 [[..]]）止。
+function extractHooksState(text) {
+  // 边界：下一个【非 hooks.state】顶层表 / 注释行（如紧跟其后的 managed END marker，绝不能吞进来，
+  // 否则 stripCodexManagedBlock 找不到 END 就剥不掉旧块）/ EOF。
+  const re = /(?:\n|^)\[hooks\.state\][\s\S]*?(?=\n\[(?!hooks\.state)|\n[ \t]*#|$)/;
+  const m = text.match(re);
+  if (!m) return { text, state: "" };
+  return { text: text.replace(re, "\n"), state: m[0].trim() };
+}
+
+// F2：删除任意 ai-otel 的 SessionStart hook（命令同时含 launch-hook.js + on-session-start.js），
+// 不论在不在 managed marker 内、单引号还是转义双引号——消除 codex 把 hook 规范化搬到 marker 外
+// 造成的永久重复。按"我们自己的命令签名"匹配，绝不误删用户的其它 SessionStart hook。
+// 组边界 = 下一个 [[hooks.SessionStart]] 同级组 / 下一个非 [[hooks.SessionStart.hooks]] 顶层表 / EOF。
+function stripAiOtelSessionStartHooks(text) {
+  const groupRe = /(?:\n|^)\[\[hooks\.SessionStart\]\][\s\S]*?(?=\n\[\[hooks\.SessionStart\]\]|\n\[(?!\[hooks\.SessionStart\.hooks\]\])|$)/g;
+  return text.replace(groupRe, (m) =>
+    /launch-hook\.js/.test(m) && /on-session-start\.js/.test(m) ? "\n" : m
+  );
+}
+
 function stripLegacyCodexOtel(text) {
   // 旧 installer 写的 [otel]（含非法 key enabled = true）整段删除，避免与新 [otel] 冲突
   return text.replace(
@@ -1256,12 +1280,23 @@ function installCodex(home, endpoint, otelTransport) {
   fs.copyFileSync(path.join(__dirname, "templates", "codex", "on-session-start.js"), hookDest);
   fs.chmodSync(hookDest, 0o755);
   const launcherDest = installLauncher(installDir);
+  // local-usage-scanner.js：由 codex on-session-start.js spawn 的 detached 子进程，
+  // 让 codex 用户(往往不开 Claude Code)每次开 codex 也能触发本地用量补报，不再只有装机那一次。
+  const localUsageScannerDest = path.join(installDir, "local-usage-scanner.js");
+  fs.copyFileSync(path.join(__dirname, "templates", "local-usage-scanner.js"), localUsageScannerDest);
+  fs.chmodSync(localUsageScannerDest, 0o755);
+  const machineId = getOrCreateMachineId(installDir);
   writeInstallLog(installDir, "codex", endpoint, otelTransport);
   const bak = backup(configPath);
   let existing = fs.existsSync(configPath) ? fs.readFileSync(configPath, "utf8") : "";
 
+  // F1：先把 codex 的 [hooks.state]（信任库）抽出来保留，否则下面 stripCodexManagedBlock 会连它一起删 → hook 失信。
+  const { text: withoutState, state: hooksState } = extractHooksState(existing);
+  existing = withoutState;
+
   // 先剥离上一次的 managed 块和旧 schema 残留，再保证用户块里有 hooks = true
   existing = stripCodexManagedBlock(existing);
+  existing = stripAiOtelSessionStartHooks(existing); // F2：删 marker 外的 ai-otel SessionStart 重复
   existing = stripLegacyCodexOtel(existing);
   existing = stripLegacyCodexHook(existing);
   existing = stripLegacyCodexHooksFlag(existing);
@@ -1269,9 +1304,17 @@ function installCodex(home, endpoint, otelTransport) {
 
   // hook 同目录的 endpoint.json：hook 脚本运行时读它拿 logs endpoint，避免依赖
   // shell 前缀注入 env（cmd.exe 不认那种语法，跨平台必须改成走文件）。
-  writeJSONAtomic(path.join(installDir, "endpoint.json"), buildEndpointConfig(endpoint, otelTransport));
+  // machineId + localUsageUrl 是 local-usage-scanner.js 必需的两个字段（scanner 读 endpoint.json）。
+  writeJSONAtomic(path.join(installDir, "endpoint.json"), {
+    ...buildEndpointConfig(endpoint, otelTransport),
+    machineId,
+    localUsageUrl: deriveLocalUsageUrl(endpoint),
+  });
   const managed = buildCodexManagedBlock(endpoint, hookDest, launcherDest, otelTransport);
-  const merged = (existing.trimEnd() + "\n\n" + managed + "\n").replace(/\n{3,}/g, "\n\n");
+  // F1：信任库放回末尾（managed marker 外），下次 strip 不会再误删；命令未变 → trusted_hash 仍匹配 → hook 持续受信。
+  let merged = existing.trimEnd() + "\n\n" + managed + "\n";
+  if (hooksState) merged += "\n" + hooksState + "\n";
+  merged = merged.replace(/\n{3,}/g, "\n\n");
   fs.writeFileSync(configPath, merged, "utf8");
   return { tool: "codex", status: "installed", path: configPath, backup: bak };
 }
