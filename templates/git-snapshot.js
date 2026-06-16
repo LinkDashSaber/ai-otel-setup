@@ -122,10 +122,11 @@ function splitDiffByFile(fullDiff) {
 
 // 按 diffstat 顺序填充 diff blocks，应用三轴上限
 function truncateDiff(fullDiff, statText, budget) {
-  if (!fullDiff) return { text: "", truncated: [], bytes: 0 };
+  if (!fullDiff) return { text: "", truncated: [], bytes: 0, map: {} };
   const orderedFiles = filesFromDiffStat(statText);
   const byFile = splitDiffByFile(fullDiff);
   const pieces = [];
+  const map = {}; // {文件路径: 该文件 diff} —— 业务 changed_files 格式
   const truncated = [];
   let used = 0;
   let fileCount = 0;
@@ -147,10 +148,11 @@ function truncateDiff(fullDiff, statText, budget) {
       continue;
     }
     pieces.push(piece);
+    map[name] = piece;
     used += pieceBytes;
     fileCount += 1;
   }
-  return { text: pieces.join(""), truncated, bytes: used };
+  return { text: pieces.join(""), truncated, bytes: used, map };
 }
 
 function resolveLogsEndpoint(cfg) {
@@ -373,14 +375,14 @@ function writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snapRe
     // -------- delta diff：本帧 vs 上一帧（首帧跳过，option C） --------
     let deltaStat = "";
     let deltaDiffRaw = "";
-    let deltaText = "";
+    let deltaMap = {};
     let deltaBytes = 0;
     let truncatedFiles = [];
     if (parent && snap) {
       deltaStat = safeGit(cwd, ["diff", "--stat", parent.commit, snap.commit], 2000);
       deltaDiffRaw = safeGit(cwd, ["diff", parent.commit, snap.commit], 5000);
       const trunc = truncateDiff(deltaDiffRaw, deltaStat, budget);
-      deltaText = trunc.text;
+      deltaMap = trunc.map;
       deltaBytes = trunc.bytes;
       truncatedFiles = trunc.truncated;
     }
@@ -434,7 +436,7 @@ function writeSnapshotBundle(cwd, rawBodiesDir, sessionId, eventKind, ts, snapRe
       "snapshot.tree_unchanged": String(treeUnchanged),
       // delta diff（相对上一帧；首帧为空）
       "snapshot.delta_diffstat": deltaStat || "",
-      "snapshot.delta_diff": deltaText,
+      "snapshot.changed_files": JSON.stringify(deltaMap), // {文件路径: 该文件 diff} —— 对上一帧 delta（业务格式）
       // 体积控制
       "snapshot.truncated_files": truncatedFiles.join(","),
       "snapshot.was_truncated": String(wasTruncated),
