@@ -42,6 +42,14 @@ function endpoint() {
   return url.toString();
 }
 
+// installer 把自己的版本号写进 endpoint.json，hook 事件原样带出去，便于服务端按版本对账。
+function installerVersion() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, "endpoint.json"), "utf8"));
+    return (cfg && cfg.installerVersion) || "";
+  } catch (_) { return ""; }
+}
+
 try {
   logEvent("gemini_hook_start", { hasSessionId: !!process.env.GEMINI_SESSION_ID });
   const cwd = process.cwd();
@@ -56,6 +64,7 @@ try {
     "git.user.name": safeGit(["-C", cwd, "config", "user.name"]),
     "hostname": os.hostname() || "",
     "data_source": "hook",
+    "installer_version": installerVersion(),
   };
   const payload = JSON.stringify({ resourceLogs: [{ resource: { attributes: [] }, scopeLogs: [{ logRecords: [{ timeUnixNano: `${Date.now()}000000`, body: { stringValue: "hook_session_start" }, attributes: Object.entries(event).map(([key, value]) => ({ key, value: { stringValue: String(value ?? "") } })) }] }] }] });
   const url = new URL(endpoint());

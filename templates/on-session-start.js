@@ -286,6 +286,7 @@ function spawnLocalUsageScanner(cfg) {
 
     const logsEndpoint = resolveLogsEndpoint();
     const installerCfg = readInstallerConfig();
+    event["installer_version"] = installerCfg.installerVersion || "";
     const resourceAttributes = [];
     if (installerCfg.fullUpload === true) {
       // 服务端 mongo-full sink 当前仍按此 attr 过滤，attr 名暂保留为 ai_otel.mongo_gray=beta

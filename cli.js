@@ -542,6 +542,7 @@ function mergeResourceAttrs(existing, gitUser) {
   const attrs = parseResourceAttrs(existing || "");
   if (gitUser.email) attrs["git.user.email"] = gitUser.email;
   if (gitUser.name) attrs["git.user.name"] = gitUser.name;
+  attrs["installer_version"] = PKG_VERSION; // CC SDK 自动挂到每条 native OTel 事件的 resource attr
   return serializeResourceAttrs(attrs);
 }
 

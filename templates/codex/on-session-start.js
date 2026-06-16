@@ -46,6 +46,14 @@ function endpoint() {
   return "http://localhost:4318/v1/logs";
 }
 
+// installer 把自己的版本号写进 endpoint.json，hook 事件原样带出去，便于服务端按版本对账。
+function installerVersion() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, "endpoint.json"), "utf8"));
+    return (cfg && cfg.installerVersion) || "";
+  } catch (_) { return ""; }
+}
+
 // 每次 codex SessionStart 都 spawn detached 的本地用量扫描器，让 codex 用户（往往不开 Claude Code）
 // 不再只有装机那一次上报。读 endpoint.json 的 localUsageUrl 决定是否启用；节流由 scanner 自身 5min 控制。
 // 这里用 process.execPath 没问题：hook 已经在 node 里跑，不涉及外层命令的 node 路径解析问题。
@@ -85,6 +93,7 @@ function spawnLocalUsageScanner() {
       "git.user.name": safeGit(["-C", cwd, "config", "user.name"]),
       "hostname": os.hostname() || "",
       "data_source": "hook",
+      "installer_version": installerVersion(),
     };
     logEvent("codex_hook_payload", event);
     const payload = JSON.stringify({ resourceLogs: [{ resource: { attributes: [] }, scopeLogs: [{ logRecords: [{ timeUnixNano: `${Date.now()}000000`, body: { stringValue: "hook_session_start" }, attributes: Object.entries(event).map(([key, value]) => ({ key, value: { stringValue: String(value ?? "") } })) }] }] }] });
