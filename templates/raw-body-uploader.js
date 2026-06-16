@@ -69,11 +69,12 @@ function sha256String(s) {
 function fileBodyKind(fileName) {
   if (/\.request\.json$/i.test(fileName)) return "request";
   if (/\.response\.json$/i.test(fileName)) return "response";
+  if (/\.snapshot\.bundle$/i.test(fileName)) return "snapshot"; // git-snapshot.js 落的 git bundle
   return "";
 }
 
 function isRawBodyFile(fileName) {
-  return /\.request\.json$/i.test(fileName) || /\.response\.json$/i.test(fileName);
+  return /\.request\.json$/i.test(fileName) || /\.response\.json$/i.test(fileName) || /\.snapshot\.bundle$/i.test(fileName);
 }
 
 function readUploadToken() {
