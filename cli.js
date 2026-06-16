@@ -220,6 +220,21 @@ function deriveLocalUsageUrl(endpoint) {
   }
 }
 
+// 灰度判定接口 URL：与 localUsageUrl 同源（raw-upload-server :8090 / ingress），仅换 path。
+function deriveGrayCheckUrl(endpoint) {
+  try {
+    const u = new URL(logsEndpointFromGrpc(endpoint));
+    u.hostname = deriveRawUploadHost(u.hostname);
+    u.port = !isIpHost(u.hostname) && !isLocalHost(u.hostname) ? "" : "8090";
+    u.pathname = "/v1/gray-check";
+    u.search = "";
+    u.hash = "";
+    return u.toString().replace(/\/+$/, "");
+  } catch (_) {
+    return "";
+  }
+}
+
 function rawUploadUrlFromEndpoint(endpoint) {
   try {
     const logsUrl = new URL(logsEndpointFromGrpc(endpoint));
@@ -443,6 +458,66 @@ function postJsonWithTimeout(targetUrl, payload, timeoutMs) {
     req.write(body);
     req.end();
   });
+}
+
+// GET + JSON 解析，带超时和 64KB 响应体上限。任何失败 reject，由 checkGray 兜成 null。
+function httpGetJsonWithTimeout(targetUrl, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try {
+      u = new URL(targetUrl);
+    } catch (e) {
+      return reject(e);
+    }
+    const isHttps = u.protocol === "https:";
+    const lib = isHttps ? require("https") : require("http");
+    const req = lib.request(
+      {
+        method: "GET",
+        hostname: u.hostname,
+        port: u.port || (isHttps ? 443 : 80),
+        path: (u.pathname || "/") + (u.search || ""),
+        timeout: timeoutMs,
+      },
+      (res) => {
+        const chunks = [];
+        let total = 0;
+        res.on("data", (c) => {
+          total += c.length;
+          if (total > 65536) {
+            req.destroy(new Error("response too large"));
+            return;
+          }
+          chunks.push(c);
+        });
+        res.on("end", () => {
+          try {
+            resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+          } catch (e) {
+            reject(e);
+          }
+        });
+        res.on("error", reject);
+      }
+    );
+    req.on("error", reject);
+    req.on("timeout", () => {
+      req.destroy(new Error("timeout"));
+    });
+    req.end();
+  });
+}
+
+// 灰度判定：true=命中灰度 / false=确认非灰度 / null=超时或不可达（调用方保留上次状态）。
+async function checkGray(endpoint, email) {
+  const url = deriveGrayCheckUrl(endpoint);
+  if (!url || !email) return null;
+  try {
+    const res = await httpGetJsonWithTimeout(`${url}?email=${encodeURIComponent(email)}`, 3000);
+    return !!(res && res.gray === true);
+  } catch (_) {
+    return null;
+  }
 }
 
 async function reportInstall(otelEndpoint, gitUser, allResults, debug, fullUpload) {
@@ -1472,10 +1547,19 @@ async function main() {
   const machineId = getOrCreateMachineId(installDir);
   const rawBodiesDir = path.join(installDir, "raw-bodies");
   const rawUploadToken = args["upload-token"] || args.uploadtoken || "";
-  // 全量数据上报开关（替代旧的 mongo-gray=beta 概念）。
-  // 当前灰度阶段：默认 false；--beta（或 full-upload=true）显式开。
+  // 全量数据上报开关，优先级：① 显式 --beta/--full-upload ② 服务端灰度名单 ③ 超时→保留上次状态。
+  // 灰度名单只能"额外开启"（enroll-only）；--beta 永远优先，名单关不掉显式开过的人。
   // 下次发版（灰度结束）时把默认翻转成 true，opt-out 改 --no-full-upload。
-  const fullUpload = truthyFlag(args.beta) || truthyFlag(args["full-upload"]);
+  let fullUpload = truthyFlag(args.beta) || truthyFlag(args["full-upload"]);
+  if (!fullUpload) {
+    const gray = await checkGray(endpoint, gitUser.email); // true / false / null(超时或不可达)
+    if (gray === true) {
+      fullUpload = true;
+    } else if (gray === null) {
+      // 接口超时/不可达：保留 endpoint.json 上次状态，避免偶发失败把已灰度老用户误关（抖动）。
+      fullUpload = readJSONSafe(path.join(installDir, "endpoint.json")).fullUpload === true;
+    }
+  }
   const explicitRawUploadUrl = normalizeOptionalUrl(args["upload-url"] || args.uploadurl);
   // rawUploadUrl 唯一来源：fullUpload（--beta）；显式 --upload-url 仍可强制覆盖。
   // 非 beta 用户不需要这个 URL，scanner/raw-body-uploader 都不会跑。
