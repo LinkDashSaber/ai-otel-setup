@@ -1,0 +1,33 @@
+image:
+  repository: ai-otel-setup
+  tag: latest
+  pullPolicy: IfNotPresent
+
+job:
+  backoffLimit: 0
+  activeDeadlineSeconds: 120
+  ttlSecondsAfterFinished: 300
+
+smoke:
+  endpoint: http://otel-mock.ai-delivery-poc.svc.cluster.local:4318
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
