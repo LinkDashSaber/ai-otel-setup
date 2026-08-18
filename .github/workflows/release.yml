@@ -34,7 +34,12 @@ jobs:
           cat > delivery-manifest.json <<'JSON'
           {
             "schema_version": 1,
-            "images": [],
+            "images": [
+              {
+                "name": "smoke",
+                "ref": "ghcr.io/linkdashsaber/ai-otel-setup:${{ inputs.image_tag || 'smoke' }}"
+              }
+            ],
             "chart": {
               "ref": "oci://example.invalid/raven-smoke/ai-otel-setup",
               "version": "0.0.1"
