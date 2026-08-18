@@ -1,0 +1,53 @@
+name: Raven delivery smoke
+
+run-name: Raven delivery smoke ${{ inputs.dispatch_id || github.run_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      dispatch_id:
+        description: Raven invocation correlation identifier
+        required: false
+        type: string
+      image_tag:
+        description: Raven-generated image tag
+        required: false
+        type: string
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify test repository
+        run: |
+          test -f package.json
+          node --version
+
+      - name: Create Raven delivery manifest
+        run: |
+          cat > delivery-manifest.json <<'JSON'
+          {
+            "schema_version": 1,
+            "images": [],
+            "chart": {
+              "ref": "oci://example.invalid/raven-smoke/ai-otel-setup",
+              "version": "0.0.1"
+            },
+            "values": {
+              "raven_smoke": true
+            }
+          }
+          JSON
+
+      - name: Upload Raven delivery manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: raven-delivery-manifest
+          path: delivery-manifest.json
+          if-no-files-found: error
