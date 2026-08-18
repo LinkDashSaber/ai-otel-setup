@@ -37,7 +37,7 @@ jobs:
             "images": [
               {
                 "name": "smoke",
-                "ref": "ghcr.io/linkdashsaber/ai-otel-setup:${{ inputs.image_tag || 'smoke' }}"
+                "ref": "ghcr.io/stefanprodan/podinfo:6.9.0"
               }
             ],
             "chart": {
