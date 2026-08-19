@@ -41,5 +41,8 @@
   "homepage": "https://github.com/decent-yu/ai-otel-setup#readme",
   "publishConfig": {
     "access": "public"
+  },
+  "scripts": {
+    "test01": "node scripts/test01.js"
   }
 }
